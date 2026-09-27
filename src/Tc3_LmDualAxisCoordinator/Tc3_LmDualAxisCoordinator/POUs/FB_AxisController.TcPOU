@@ -1,0 +1,1155 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_AxisController" Id="{f908ab4d-8156-4aaf-8a85-e0937d5ba97b}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           16.09.2026
+// POU:            FB_AxisController
+// Version:        1.0.0.0
+// ==============================================================================
+/// State-based motion control execution layer for an individual TwinCAT NC axis.
+/// Integrates standard motion control function blocks into a deterministic,
+/// priority-governed state machine.
+//
+// Operational Architecture & Features:
+// - High-Priority Command Preemption: Evaluates overrides before internal state logic 
+//   in strict hierarchy: Faults > Hardware Power Loss > Software Disable > Stop > Halt.
+// - Command Ingestion & Edge Filtering: Accepts both latched (maintained) and pulsed 
+//   command signals on AxisCmd; internally filters dynamic triggers through dedicated 
+//   R_TRIG edge detectors to prevent command looping, double-cycling, or signal 
+//   persistence across states (e.g. an HMI button held TRUE executes exactly once 
+//   and will not re-launch motion when the axis returns to IDLE).
+//   - Trajectory & Recovery Commands (xMoveAbs, xMoveVelo, xHome, xHalt, xReset): 
+//     Actioned exclusively on the single-scan rising edge isolated by the internal filters.
+//   - Operational Permissives & Holds (xPowerEnable, xStop, manual jog vectors): 
+//     Require static HIGH levels to maintain their active operational state. 
+//     In addition, xPowerEnable is internally edge-filtered in the OFF state to 
+//     strictly enforce IEC 60204-1 anti-restart protection against pre-latched signals.
+// - Two-Instance Ping-Pong Trajectory Retargeting: Employs alternating dual-instance 
+//   function block pairs configured with BufferMode := MC_Aborting for both MOVEABS 
+//   (fbMoveAbsolute1/2) and MOVEVELO (fbMoveVelocity1/2). Pulsing command inputs mid-flight 
+//   seamlessly retargets destination coordinates, velocities, directions, or dynamic ramps 
+//   on the fly without intermediate standstill, velocity dips, or 1-cycle execution deadbands.
+// - Configurable Homing Routines: Executes axis calibration based on stConfig.eHomingMode 
+//   (e.g. standard cam search, direct position setting, torque limits) using xCalibrationCam.
+// - Comprehensive Motion & Drive Protections: Enforces directional feed limits (xEnablePositive, 
+//   xEnableNegative), supervises drive power-up timing against timPowerTimeout, resolves mutual 
+//   exclusion on conflicting jog directions and speeds, detects external NC-level motion in IDLE, 
+//   commands active deceleration ramps on software disable, and actively stops moving axes 
+//   upon internal software faults to prevent uncontrolled coasting.
+// - Anti-Restart Safety: Requires an explicit rising edge on xPowerEnable to prevent unexpected 
+//   automatic drive energization following main power restoration or safety circuit resets.
+// - Unified Fault Handling & Recovery: Captures internal software timeouts, motion aborts, 
+//   configuration parameter limit trips, and NC kernel/drive faults; diagnostic error IDs remain 
+//   latched throughout recovery, and all fault states require an explicit operator reset pulse 
+//   to confirm and clear once resolved.
+{attribute 'hide_all_locals'}
+FUNCTION_BLOCK FB_AxisController
+VAR_INPUT
+    // --- Motion Permissives & Safety Interlocks ---
+    
+    /// Permissive authorization input to allow manual continuous jogging.
+    /// Evaluated in IDLE and HALTING states as an entry gate into JOGGING. When FALSE, new jogging 
+    /// requests are rejected. (Note: Does not interrupt a jog already in progress).
+    xAllowJog              : BOOL;
+
+    /// Master motion interlock input that inhibits new motion commands.
+    /// When TRUE, blocks entering HOMING, MOVEABS, MOVEVELO, and JOGGING from IDLE or HALTING. 
+    /// Also suppresses on-the-fly target position updates during active MOVEABS motion.
+    xMotionInterlock       : BOOL;
+
+    /// Directional feed enable for positive motion.
+    /// Passed directly to the drive power stage (MC_Power.Enable_Positive). When FALSE, the NC kernel 
+    /// rejects motion in the positive direction (e.g. forward limit switch trip). Default is TRUE.
+    xEnablePositive        : BOOL := TRUE;
+
+    /// Directional feed enable for negative motion.
+    /// Passed directly to the drive power stage (MC_Power.Enable_Negative). When FALSE, the NC kernel 
+    /// rejects motion in the negative direction (e.g. reverse limit switch trip). Default is TRUE.
+    xEnableNegative        : BOOL := TRUE;
+
+    /// Digital reference cam input signal for homing calibration.
+    /// Passed directly to the homing execution block (MC_Home.bCalibrationCam). Used during 
+    /// calibration to establish axis coordinate reference upon detecting the sensor edge.
+    xCalibrationCam        : BOOL;
+END_VAR
+
+VAR_IN_OUT CONSTANT
+    // --- Ingress Command Pipelines & Dynamic Constraints (Read-Only) ---
+
+    /// Read-only reference to the incoming axis command structure.
+    /// Expects ST_AxisSystemCmd containing operational command signals. Edge-triggered commands 
+    /// (xMoveAbs, xMoveVelo, xHome, xHalt, xReset, xPowerEnable) are filtered internally via edge detectors, 
+    /// supporting both pulsed and maintained input signals. Level commands (xStop, jog vectors) are evaluated directly.
+    AxisCmd                : ST_AxisSystemCmd;
+
+    /// Read-only reference to the cyclic NC feedback status structure.
+    /// Expects ST_AxisFeedback containing live NC process data: actual position, actual velocity, 
+    /// moving status, operational readiness, NC error status, error ID, and electronic coupling state (xInGear).
+    AxisFeedback           : ST_AxisFeedback;
+
+    /// Read-only reference to the axis configuration and kinematic limits structure.
+    /// Expects ST_AxisConfig containing profile dynamics: target position, maximum velocity, acceleration, 
+    /// deceleration, jerk, halt/stop parameters, homing settings, jog speeds, and power timeout settings.
+    stConfig               : ST_AxisConfig;
+END_VAR
+
+VAR_IN_OUT
+    // --- Hardware NC Axis Interface ---
+
+    /// Bidirectional hardware interface linking the PLC to the TwinCAT NC axis.
+    /// Must be connected to an AXIS_REF instance linked to an NC axis in the TwinCAT motion task.
+    Axis                   : AXIS_REF;
+END_VAR
+
+VAR_OUTPUT
+    // --- Operational Telemetry & Diagnostics ---
+
+    /// Active operational state of the axis controller state machine.
+    /// Outputs E_AxisState (OFF, POWERING, IDLE, HOMING, MOVEABS, MOVEVELO, JOGGING, 
+    /// EXTERNAL_MOTION, HALTING, STOPPING, GEARED, RESET, ERROR).
+    eCurrentState          : E_AxisState;
+
+    /// Active travel direction tracked during continuous velocity motion.
+    /// Outputs MC_Direction (e.g. MC_Positive_Direction, MC_Negative_Direction) active during MOVEVELO.
+    eActiveDirection       : MC_Direction := MC_Undefined_Direction;
+
+    /// Fault flag asserted TRUE whenever the controller is in the ERROR state.
+    /// Evaluates TRUE if and only if eCurrentState = E_AxisState.ERROR. Indicates an active NC kernel fault, 
+    /// drive hardware trip, motion execution error, or internal power-up timeout.
+    xError                 : BOOL;
+
+    /// Active diagnostic error ID.
+    /// - 16#4000..16#4FFF: TwinCAT NC kernel or drive amplifier hardware trip (refer to Beckhoff Infosys).
+    /// - 16#8000..16#8FFF: Motion library software fault (refer to E_AxisError).
+    /// - 0: System is healthy.
+    udiErrorId             : UDINT;
+END_VAR
+
+VAR
+    // --- Backing Variables (Internal State for Cycle-Boundary Output Mapping) ---
+    _eCurrentState         : E_AxisState;                          // Internal state machine register mapped to eCurrentState
+    _eActiveDirection      : MC_Direction := MC_Undefined_Direction; // Command direction currently tracked by MOVEVELO
+    _xError                : BOOL;                                 // Internal fault flag asserted when in ERROR state
+    _udiErrorId            : UDINT;                                // Latched diagnostic fault ID; held until safe transition to IDLE or OFF
+	
+    // --- Motion Function Blocks & On-The-Fly Retargeting ---
+    fbPower                : MC_Power;        // Manages software drive enable and directional permissive feed inputs
+    fbReset                : MC_Reset;        // Clears NC-SAF kernel errors and drive hardware trips (transitions axis out of ErrorStop)
+	fbMoveAbsolute1        : MC_MoveAbsolute; // Primary instance for absolute positioning
+    fbMoveAbsolute2        : MC_MoveAbsolute; // Alternate instance for seamless on-the-fly target retargeting (Ping-Pong pattern)
+    xToggleMoveAbs         : BOOL;            // Alternating instance selector (FALSE = Instance 1 active, TRUE = Instance 2 active)
+	fbMoveVelocity1        : MC_MoveVelocity; // Primary instance for continuous velocity
+    fbMoveVelocity2        : MC_MoveVelocity; // Alternate instance for on-the-fly dynamic velocity retargeting
+    xToggleMoveVelo        : BOOL;            // Alternating instance selector for MoveVelo
+	fbStop                 : MC_Stop;         // Enforces active deceleration stop and actively locks the axis against new commands
+    fbHalt                 : MC_Halt;         // Controlled deceleration stop that permits in-flight abortive preemption
+    fbHome                 : MC_Home;         // Executes NC referencing calibration using configured homing mode and reference cam
+    fbJog                  : MC_Jog;          // Executes continuous manual jog movements in forward and reverse directions
+	
+    // --- Manual Jog Direction & Speed Conflict Arbitration ---
+    xJogBkwActive          : BOOL; // Evaluates if either fast or slow backward jog is asserted
+    xJogFwdActive          : BOOL; // Evaluates if either fast or slow forward jog is asserted
+    xJogBkwSpeedConflict   : BOOL; // Interlock detecting invalid simultaneous assertion of fast and slow backward jog
+    xJogFwdSpeedConflict   : BOOL; // Interlock detecting invalid simultaneous assertion of fast and slow forward jog
+	
+    // --- Asynchronous Execution Supervision Timers ---
+    tonPower               : TON; // Supervises drive hardware ready confirmation against stConfig.timPowerTimeout
+    tonExternalMotion      : TON; // Filters NC-SAF cycle jitter and detects unauthorized external motion while in IDLE
+	
+    // --- Command Input Edge Detection (Anti-Latching & Pulse Conditioning) ---
+    // Converts incoming sustained or pulsed commands into clean single-scan execution pulses
+    fbPulsedCmdPowerEnable : R_TRIG; // Edge detector for deliberate drive power-on (anti-restart protection)
+    fbPulsedCmdMoveAbs     : R_TRIG; // Edge detector for absolute move initiation and in-flight retargeting
+    fbPulsedCmdMoveVelo    : R_TRIG; // Edge detector for velocity move requests
+    fbPulsedCmdHome        : R_TRIG; // Edge detector for axis homing calibration
+    fbPulsedCmdHalt        : R_TRIG; // Edge detector for controlled halt requests
+    fbPulsedCmdReset       : R_TRIG; // Edge detector for fault reset commands (prevents continuous reset hammering)
+	
+    // --- External NC Fault Recovery Synchronization ---
+    fbNcErrorFallingEdge   : F_TRIG; // Detects external NC Online Tab (F8) or ADS fault clearance to resynchronize state machine
+	
+	// --- Dynamic Configuration Invariant Telemetry ---
+    udiConfigErrorId         : UDINT; // Evaluated once per cycle by fValidateAxisConfig (0 if valid)
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ==============================================================================
+// 1. COMMAND EDGE DETECTION (CYCLIC UPDATE)
+// ==============================================================================
+// Evaluates incoming command signals to generate clean, single-scan execution pulses.
+// Defends internal state transitions against caller signal persistence, latched HMI 
+// buttons, or asynchronous scan timing mismatches.
+fbPulsedCmdPowerEnable(CLK := AxisCmd.xPowerEnable);
+fbPulsedCmdMoveAbs    (CLK := AxisCmd.xMoveAbs);
+fbPulsedCmdMoveVelo   (CLK := AxisCmd.xMoveVelo);
+fbPulsedCmdHome       (CLK := AxisCmd.xHome);
+fbPulsedCmdHalt       (CLK := AxisCmd.xHalt);
+fbPulsedCmdReset      (CLK := AxisCmd.xReset);
+
+// Detects the transition where an external diagnostic tool (TwinCAT NC Online Tab F8 
+// or ADS client) clears an NC kernel fault, allowing autonomous recovery synchronization.
+fbNcErrorFallingEdge  (CLK := AxisFeedback.xError);
+
+// Evaluates configuration invariants once per cycle (0 if valid, or specific E_AxisError ID)
+udiConfigErrorId := fValidateAxisConfig(stConfig);
+
+// ==============================================================================
+// 2. HIGH-PRIORITY COMMAND INTERRUPTS (STATE OVERRIDES)
+// ==============================================================================
+// Evaluates safety interlocks, drive hardware integrity, and high-priority operator 
+// preemption before executing internal state logic.
+// Priority Hierarchy: NC Fault > Hardware Power Loss > Software Disable > Stop > Halt
+
+// Priority 1A: Axis Hardware / NC Kernel Fault Override
+IF AxisFeedback.xError AND (_eCurrentState <> E_AxisState.RESET) THEN 
+    // Forces the ERROR state immediately whenever the NC kernel registers a fault.
+    // The RESET state is explicitly excluded to allow the MC_Reset sequence to 
+    // execute and clear drive/NC registers without cyclically re-tripping the state.
+    _eCurrentState := E_AxisState.ERROR;
+	
+// Priority 1B: Configuration Parameter Invariant Guard (Supervised while energized or on power-on request)
+ELSIF ((_eCurrentState <> E_AxisState.OFF) OR fbPulsedCmdPowerEnable.Q)
+      AND (_eCurrentState <> E_AxisState.RESET)
+      AND (udiConfigErrorId <> 0) THEN
+      
+    _udiErrorId    := udiConfigErrorId;
+    _eCurrentState := E_AxisState.ERROR;
+	
+// Priority 2A: Hardware Power Loss (Inverter Bridge / STO De-energized)
+ELSIF (NOT fbPower.Status)
+      AND (_eCurrentState <> E_AxisState.POWERING)
+      AND (_eCurrentState <> E_AxisState.RESET)
+      AND (_eCurrentState <> E_AxisState.ERROR) THEN 
+    // Immediate fallback to OFF when hardware power is lost. An unpowered inverter bridge 
+    // cannot generate counter-torque, making a controlled deceleration stop physically 
+    // impossible. We explicitly exclude POWERING, RESET, and ERROR because drive power 
+    // is expected to be temporarily absent during boot-up and fault recovery sequences.
+    _eCurrentState := E_AxisState.OFF;
+
+// Priority 2B: User-Intended Software Disable Request
+ELSIF (NOT AxisCmd.xPowerEnable)
+      AND (_eCurrentState <> E_AxisState.POWERING)
+      AND (_eCurrentState <> E_AxisState.RESET)
+      AND (_eCurrentState <> E_AxisState.ERROR)
+      AND (_eCurrentState <> E_AxisState.OFF)
+      AND (_eCurrentState <> E_AxisState.STOPPING) THEN
+	  
+    // If moving, execute a controlled deceleration ramp to 0.0 mm/s to protect drivetrain
+    IF AxisFeedback.xMoving THEN
+        _eCurrentState           := E_AxisState.STOPPING;
+		xToggleMoveAbs           := FALSE;
+		xToggleMoveVelo			 := FALSE;
+        fbMoveAbsolute1.Execute  := FALSE;
+        fbMoveAbsolute2.Execute  := FALSE;
+        fbMoveVelocity1.Execute  := FALSE;
+		fbMoveVelocity2.Execute	 := FALSE;
+        fbJog.JogBackwards       := FALSE;
+        fbJog.JogForward         := FALSE;
+        fbHome.Execute           := FALSE;
+        fbHalt.Execute           := FALSE;
+        fbReset.Execute          := FALSE;
+    ELSE
+        // Already stationary at standstill -> De-energize immediately to safe OFF
+        _eCurrentState := E_AxisState.OFF;
+    END_IF
+
+// Priority 3: Stop Command (Highest Motion Interrupt - Level-Triggered)	
+ELSIF AxisCmd.xStop AND (_eCurrentState <> E_AxisState.STOPPING) THEN
+    // Transitions into STOPPING to lock the axis setpoint generator. Level-triggered to 
+    // keep the axis actively locked at standstill for as long as xStop is held TRUE.
+    // Clears all active motion execute pins to prevent automatic re-triggering upon stop release.
+    _eCurrentState          := E_AxisState.STOPPING;
+	xToggleMoveAbs          := FALSE;
+	xToggleMoveVelo			:= FALSE;
+    fbMoveAbsolute1.Execute := FALSE;
+    fbMoveAbsolute2.Execute := FALSE;
+    fbMoveVelocity1.Execute := FALSE;
+	fbMoveVelocity2.Execute	:= FALSE;
+    fbJog.JogBackwards      := FALSE;
+    fbJog.JogForward        := FALSE;
+    fbHome.Execute          := FALSE;
+    fbHalt.Execute          := FALSE;
+
+// Priority 4: Halt Command (Abortive Deceleration Ramp - Edge-Triggered)
+ELSIF fbPulsedCmdHalt.Q AND (_eCurrentState <> E_AxisState.HALTING)
+      AND (_eCurrentState <> E_AxisState.STOPPING)
+      AND (_eCurrentState <> E_AxisState.OFF)
+      AND (_eCurrentState <> E_AxisState.POWERING) THEN
+    // Transitions into HALTING on a single rising edge to initiate an aborting stop ramp.
+    // Unlike Stop, Halt permits subsequent motion commands to abort the deceleration mid-flight.
+    _eCurrentState          := E_AxisState.HALTING;
+	xToggleMoveAbs          := FALSE;
+	xToggleMoveVelo			:= FALSE;
+    fbMoveAbsolute1.Execute := FALSE;
+    fbMoveAbsolute2.Execute := FALSE;
+    fbMoveVelocity1.Execute := FALSE;
+	fbMoveVelocity2.Execute	:= FALSE;
+    fbJog.JogBackwards      := FALSE;
+    fbJog.JogForward        := FALSE;
+    fbHome.Execute          := FALSE;
+END_IF
+
+// ==============================================================================
+// 3. ASYNCHRONOUS SUPERVISION TIMERS (CYCLIC EXECUTION)
+// ==============================================================================
+// Executing timers unconditionally outside the CASE structure guarantees that their 
+// internal accumulators (ET) cleanly reset to T#0s the instant the monitored state exits.
+
+// Supervises drive power-up duration against stConfig.timPowerTimeout to detect inverter faults
+tonPower(
+    IN := (_eCurrentState = E_AxisState.POWERING),
+    PT := TO_TIME(stConfig.lrPowerTimeout * 1000.0)
+);
+
+// Supervises physical movement during IDLE. Filters closed-loop servo settling jitter 
+// (stConfig.timJitterTolerance) while detecting unauthorized external motion (NC Online Tab, ADS)
+tonExternalMotion(
+    IN := (_eCurrentState = E_AxisState.IDLE) AND AxisFeedback.xMoving,
+    PT := TO_TIME(stConfig.lrJitterTolerance)
+);
+
+// ==============================================================================
+// 4. MAIN AXIS STATE MACHINE
+// ==============================================================================
+CASE _eCurrentState OF
+    
+    E_AxisState.OFF:
+        // --------------------------------------------------------------------------
+        // State: OFF (De-Energized Safe Resting State)
+        // --------------------------------------------------------------------------
+        // De-energizes the drive power stage via MC_Power and maintains a completely 
+        // clean execution slate across all internal function blocks.
+        //
+        // Invariants & Safety Mechanics:
+        // 1. Full Command Sweeping: Unconditionally de-asserts execution signals across 
+        //    all encapsulated motion, jogging, stopping, and reset function blocks. This 
+        //    guarantees that rising-edge-triggered blocks (e.g. MC_MoveAbsolute, MC_Reset) 
+        //    are completely unlatched and primed for subsequent cycles.
+        // 2. Instance Selector Reset: Resets xToggleMoveAbs to FALSE, ensuring that any 
+        //    positioning profile initiated after power restoration begins on Instance 1.
+        // 3. Anti-Restart Protection (IEC 60204-1): Transitioning to POWERING strictly 
+        //    requires a deliberate rising edge (fbPulsedCmdPowerEnable.Q). If main power 
+        //    recovers while an enable switch or HMI toggle was left in the ON position, 
+        //    the static level is ignored, preventing unintended automatic re-energization.
+        // --------------------------------------------------------------------------
+        fbPower.Enable := FALSE;
+        
+        // Comprehensive Command Sweeper
+        xToggleMoveAbs          := FALSE;
+		xToggleMoveVelo			:= FALSE;
+        fbMoveAbsolute1.Execute := FALSE;
+        fbMoveAbsolute2.Execute := FALSE;
+        fbMoveVelocity1.Execute := FALSE;
+		fbMoveVelocity2.Execute	:= FALSE;
+        fbJog.JogBackwards      := FALSE;
+        fbJog.JogForward        := FALSE;
+        fbStop.Execute          := FALSE;
+        fbHalt.Execute          := FALSE;
+        fbHome.Execute          := FALSE;
+        fbReset.Execute         := FALSE;
+        
+        // Power-On Transition (Guarded centrally in Section 2)
+        IF fbPulsedCmdPowerEnable.Q THEN
+            _eCurrentState := E_AxisState.POWERING;
+        END_IF
+		
+    E_AxisState.POWERING:
+        // --------------------------------------------------------------------------
+        // State: POWERING (Asynchronous Drive Enable Supervision)
+        // --------------------------------------------------------------------------
+        // Commands the drive power stage to energize via MC_Power and supervises the 
+        // hardware handshaking response against supervisory timer tonPower.
+        //
+        // Transition Arbitration:
+        // - Path 1 (User Abort): If the operator or sequencer revokes AxisCmd.xPowerEnable 
+        //   before power confirmation is achieved, immediately falls back to OFF.
+        // - Path 2 (Operational Ready Confirmation): Once fbPower.Status reports TRUE, 
+        //   the NC kernel confirms the inverter bridge is closed, fieldbus communication 
+        //   is synchronized, and the axis is in closed-loop standstill. 
+        //   Gearing-Aware Routing: Inspects AxisFeedback.xInGear immediately. If the axis 
+        //   is already coupled in the NC kernel (e.g., persistent tandem pairing across 
+        //   power cycles), routes directly to GEARED to avoid exposing a transient 1-cycle 
+        //   false IDLE state to supervisory coordinators. Otherwise transitions to IDLE.
+        // - Path 3 (Drive Hardware Trip): If the drive firmware trips (e.g. STO open, 
+        //   DC bus undervoltage), fbPower.Error captures the error ID and transitions to ERROR.
+        // - Path 4 (Timeout Guard): If the drive fails to report Status within the configured 
+        //   stConfig.timPowerTimeout, tonPower.Q trips ERR_POWER_TIMEOUT (16#8001) to prevent 
+        //   indefinite hanging in this transitional state.
+        // --------------------------------------------------------------------------
+        fbPower.Enable := TRUE;
+        
+        // Path 1: Operator / Sequencer Abort
+        IF NOT AxisCmd.xPowerEnable THEN
+            _eCurrentState := E_AxisState.OFF;
+
+        // Path 2: Drive Power Stage Confirmed Active by NC Kernel
+        ELSIF fbPower.Status THEN
+            // Gearing-Aware Dispatch: Eliminate 1-cycle transient IDLE if already geared
+            IF AxisFeedback.xInGear THEN
+                _eCurrentState := E_AxisState.GEARED;
+            ELSE
+                _eCurrentState := E_AxisState.IDLE;
+            END_IF
+
+        // Path 3: Drive Hardware or Fieldbus Trip During Enable Sequence
+        ELSIF fbPower.Error THEN
+            _udiErrorId    := fbPower.ErrorID;
+            _eCurrentState := E_AxisState.ERROR;
+
+        // Path 4: Supervisory Timeout Guard
+        ELSIF tonPower.Q THEN
+            _udiErrorId    := TO_UDINT(E_AxisError.ERR_POWER_TIMEOUT); 
+            _eCurrentState := E_AxisState.ERROR;
+        END_IF
+    
+    E_AxisState.IDLE:
+        // --------------------------------------------------------------------------
+        // State: IDLE (Healthy Standby & Command Dispatcher)
+        // --------------------------------------------------------------------------
+        // The axis is powered, stationary at standstill (0.0 mm/s), healthy, and actively 
+        // awaiting operational motion commands.
+        //
+        // Invariants & Command Priority Hierarchy:
+        // 1. Execution Slate Maintenance: Continuously resets motion execution pins to FALSE, 
+        //    ensuring all downstream motion function blocks are unlatched and ready to detect 
+        //    fresh rising edges. Resets xToggleMoveAbs to FALSE.
+        // 2. Strict ELSIF Precedence Chaining: Eliminates command contention by evaluating 
+        //    permissives and command edges in a deterministic hierarchy:
+        // 	   - Priority 1 NC Online Tab / Kernel Coupling Desynchronization Guard
+        //       Explicitly added to catch cases where a commissioning engineer manually couples 
+        //       the axis directly from the TwinCAT NC Axis Online tab (or via external ADS commands) 
+        //       bypassing the PLC command pipeline. If the NC kernel indicates that the axis is coupled 
+        //       (AxisFeedback.xInGear = TRUE), the state machine immediately promotes to GEARED. 
+        // 	 	 This structurally locks out independent positioning, homing, and jogging commands, 
+        //       preventing NC Error 0x435A (Motion command rejected on coupled slave axis).
+        //    - Priority 2 (External NC Motion Detection): If physical motion is detected without 
+        //      a PLC command (persisting past the jitter filter tonExternalMotion.Q), transitions 
+        //      to EXTERNAL_MOTION to maintain truthful telemetry for supervisory modules.
+        //    - Priority 3 (Referencing / Calibration): Evaluates fbPulsedCmdHome.Q and xMotionInterlock.
+        //    - Priority 4 (Absolute Positioning): Evaluates fbPulsedCmdMoveAbs.Q and xMotionInterlock.
+        //    - Priority 5 (Continuous Velocity): Evaluates fbPulsedCmdMoveVelo.Q, xMotionInterlock, 
+        //      and validates that stConfig.eActiveDirection is not MC_Undefined_Direction.
+        //    - Priority 6 (Continuous Manual Jogging): Evaluates sustained jog inputs, 
+        //      xAllowJog authorization, and xMotionInterlock.
+        // --------------------------------------------------------------------------
+        xToggleMoveAbs          := FALSE;
+		xToggleMoveVelo			:= FALSE;
+        fbMoveAbsolute1.Execute := FALSE;
+        fbMoveAbsolute2.Execute := FALSE;
+        fbMoveVelocity1.Execute := FALSE;
+		fbMoveVelocity2.Execute	:= FALSE;
+        fbJog.JogBackwards      := FALSE;
+        fbJog.JogForward        := FALSE;
+        fbStop.Execute          := FALSE;
+        fbHalt.Execute          := FALSE;
+        fbHome.Execute          := FALSE;
+        fbReset.Execute         := FALSE;
+        
+        // Priority 1: NC Coupling State (Guards against independent motion on geared slave)
+        IF AxisFeedback.xInGear THEN
+            _eCurrentState := E_AxisState.GEARED;
+            
+        // Priority 2: External Autonomous Motion Detection (NC Online Tab, ADS, Functions Tab)
+        ELSIF tonExternalMotion.Q THEN
+            _eCurrentState := E_AxisState.EXTERNAL_MOTION;
+            
+        // Priority 3: Axis Referencing Calibration
+        ELSIF fbPulsedCmdHome.Q AND NOT xMotionInterlock THEN
+            _eCurrentState := E_AxisState.HOMING;
+            
+        // Priority 4: Absolute Positioning Profile
+        ELSIF fbPulsedCmdMoveAbs.Q AND NOT xMotionInterlock THEN
+            _eCurrentState := E_AxisState.MOVEABS;
+            
+        // Priority 5: Continuous Velocity Profile
+        ELSIF fbPulsedCmdMoveVelo.Q AND NOT xMotionInterlock AND NOT (stConfig.eActiveDirection = MC_Undefined_Direction) THEN
+            _eCurrentState := E_AxisState.MOVEVELO;
+            
+        // Priority 6: Manual Continuous Jogging
+        ELSIF (AxisCmd.xJogBkwFast
+            OR AxisCmd.xJogBkwSlow
+            OR AxisCmd.xJogFwdSlow
+            OR AxisCmd.xJogFwdFast)
+            AND xAllowJog
+            AND NOT xMotionInterlock THEN
+            _eCurrentState := E_AxisState.JOGGING;
+            
+        END_IF
+		
+	E_AxisState.HOMING:
+        // --------------------------------------------------------------------------
+        // State: HOMING (Axis Coordinate System Calibration & Referencing)
+        // --------------------------------------------------------------------------
+        // Executes the axis referencing sequence using the encapsulated MC_Home block.
+        // The calibration mode (stConfig.eHomingMode) and coordinate reference offset 
+        // (stConfig.lrHomePosition) are evaluated dynamically alongside xCalibrationCam.
+        //
+        // Operational Invariants:
+        // 1. Standstill Entry Prerequisite: Initiating homing is strictly permitted from 
+        //    IDLE only. Calibration requires a verified stationary baseline to prevent 
+        //    sensor overtravel or false zero-pulse latches.
+        // 2. Abort Invalidation: If interrupted mid-sequence by top-level interrupts 
+        //    (Stop or Halt), the homing sequence aborts immediately. The axis reference 
+        //    flag (Axis.Status.Homed) remains FALSE, and homing must be re-run from 
+        //    the start; partial homing is strictly invalid.
+        // 3. Execution Latch: fbHome.Execute is maintained TRUE throughout calibration 
+        //    and cleared automatically upon transitioning out to IDLE, HALTING, or ERROR.
+        // --------------------------------------------------------------------------
+        fbHome.Execute := TRUE; 
+        
+        // Calibration sequence completed successfully; NC axis zero reference established
+        IF fbHome.Done THEN
+            _eCurrentState := E_AxisState.IDLE;
+            
+        // Homing sequence aborted mid-travel (e.g. limit switch trip, external preemption)
+        ELSIF fbHome.CommandAborted THEN
+            fbHome.Execute := FALSE;
+            _eCurrentState := E_AxisState.HALTING;
+        
+        // Drive hardware or NC kernel homing error (e.g. cam search timeout, drive fault)
+        ELSIF fbHome.Error THEN
+            _udiErrorId    := fbHome.ErrorID;
+            _eCurrentState := E_AxisState.ERROR;
+        END_IF
+
+    E_AxisState.MOVEABS:
+        // --------------------------------------------------------------------------
+        // State: MOVEABS (Absolute Positioning with On-The-Fly Retargeting)
+        // --------------------------------------------------------------------------
+        // Commands the axis to traverse to an absolute coordinate (stConfig.lrTargetPosition) 
+        // using the Two-Instance Ping-Pong Pattern (fbMoveAbsolute1 and fbMoveAbsolute2) 
+        // configured with BufferMode := MC_Aborting.
+        //
+        // The Two-Instance Ping-Pong Architecture:
+        // Under PLCopen specifications, a single MC_MoveAbsolute instance actively controlling 
+        // an axis rejects new target parameters while its Active output is TRUE. 
+        // When a fresh command pulse (fbPulsedCmdMoveAbs.Q) arrives mid-flight (e.g. an optical 
+        // sensor detects an obstacle and commands an automatic door to immediately reopen):
+        // 1. The selector flag xToggleMoveAbs flips binary state (FALSE <-> TRUE).
+        // 2. The previously active instance is de-asserted (Execute := FALSE).
+        // 3. The alternate instance fires with Execute := TRUE and BufferMode := MC_Aborting.
+        // 4. The NC setpoint generator detects a fresh command from a new block instance, 
+        //    smoothly recalculates the trajectory on the fly without stopping, and continues 
+        //    toward the new target coordinate within configured jerk and acceleration limits.
+        // 5. The state machine monitors Done, CommandAborted, and Error strictly on the 
+        //    currently active instance selected by xToggleMoveAbs.
+        // --------------------------------------------------------------------------
+        
+        // 1. Detect dynamic on-the-fly retarget request while moving
+        IF fbPulsedCmdMoveAbs.Q AND NOT xMotionInterlock THEN
+            xToggleMoveAbs := NOT xToggleMoveAbs;
+        END_IF
+
+        // 2. Drive active instance and supervise handshakes based on current selector
+        IF xToggleMoveAbs THEN
+            // Instance 2 is Active
+            fbMoveAbsolute1.Execute := FALSE;
+            fbMoveAbsolute2.Execute := TRUE;
+            
+            // Handshake & Status Supervision for Instance 2
+            IF fbMoveAbsolute2.Done THEN
+                _eCurrentState := E_AxisState.IDLE;
+            ELSIF fbMoveAbsolute2.CommandAborted THEN
+                fbMoveAbsolute2.Execute := FALSE;
+                _eCurrentState          := E_AxisState.HALTING;
+            ELSIF fbMoveAbsolute2.Error THEN
+                _udiErrorId    := fbMoveAbsolute2.ErrorID;
+                _eCurrentState := E_AxisState.ERROR;
+            END_IF
+        ELSE
+            // Instance 1 is Active
+            fbMoveAbsolute2.Execute := FALSE;
+            fbMoveAbsolute1.Execute := TRUE;
+            
+            // Handshake & Status Supervision for Instance 1
+            IF fbMoveAbsolute1.Done THEN
+                _eCurrentState := E_AxisState.IDLE;
+            ELSIF fbMoveAbsolute1.CommandAborted THEN
+                fbMoveAbsolute1.Execute := FALSE;
+                _eCurrentState          := E_AxisState.HALTING;
+            ELSIF fbMoveAbsolute1.Error THEN
+                _udiErrorId    := fbMoveAbsolute1.ErrorID;
+                _eCurrentState := E_AxisState.ERROR;
+            END_IF
+        END_IF
+        
+    E_AxisState.MOVEVELO:
+        // --------------------------------------------------------------------------
+        // State: MOVEVELO (Continuous Velocity with Two-Instance Ping-Pong Retargeting)
+        // --------------------------------------------------------------------------
+        // Commands the axis to accelerate to and maintain a continuous setpoint velocity 
+        // (stConfig.lrMaxVelocity) in the direction defined by stConfig.eActiveDirection 
+        // using the Two-Instance Ping-Pong Pattern (fbMoveVelocity1 and fbMoveVelocity2) 
+        // configured with BufferMode := MC_Aborting.
+        //
+        // The Two-Instance Ping-Pong Velocity Architecture:
+        // Under PLCopen specifications, a single MC_MoveVelocity instance actively controlling 
+        // an axis requires a fresh rising edge on its Execute pin to register dynamic updates. 
+        // Attempting to re-arm a single block by dropping Execute to FALSE for one cycle introduces 
+        // a 1-scan execution gap and risks capturing intermediate numbers typed rapidly on an HMI.
+        //
+        // When a fresh command pulse (fbPulsedCmdMoveVelo.Q) arrives mid-flight (e.g. an operator 
+        // adjusts line throughput or an optical sensor requests a dynamic speed change):
+        // 1. The selector flag xToggleMoveVelo flips binary state (FALSE <-> TRUE).
+        // 2. The previously active instance is de-asserted (Execute := FALSE).
+        // 3. The alternate instance fires with Execute := TRUE and BufferMode := MC_Aborting, 
+        //    passing updated velocity, acceleration, deceleration, jerk, and direction setpoints.
+        // 4. The NC setpoint generator detects a fresh command from a new block instance, 
+        //    smoothly recalculates the velocity ramp on the fly without intermediate stops or 
+        //    cycle lag, transitioning toward the new target velocity within configured jerk limits.
+        // 5. The state machine monitors CommandAborted and Error strictly on the currently 
+        //    active instance selected by xToggleMoveVelo.
+        // --------------------------------------------------------------------------
+        
+        // 1. Detect dynamic on-the-fly retarget request while running
+        IF fbPulsedCmdMoveVelo.Q AND NOT xMotionInterlock AND NOT (stConfig.eActiveDirection = MC_Undefined_Direction) THEN
+            xToggleMoveVelo := NOT xToggleMoveVelo;
+        END_IF
+
+        // 2. Drive active instance and supervise handshakes based on current selector
+        IF xToggleMoveVelo THEN
+            // Instance 2 is Active
+            fbMoveVelocity1.Execute := FALSE;
+            fbMoveVelocity2.Execute := TRUE;
+            _eActiveDirection       := stConfig.eActiveDirection;
+            
+            // Handshake & Status Supervision for Instance 2
+            IF fbMoveVelocity2.CommandAborted THEN
+                fbMoveVelocity2.Execute := FALSE;
+                _eCurrentState          := E_AxisState.HALTING;
+            ELSIF fbMoveVelocity2.Error THEN
+                _udiErrorId    := fbMoveVelocity2.ErrorID;
+                _eCurrentState := E_AxisState.ERROR;
+            END_IF
+        ELSE
+            // Instance 1 is Active
+            fbMoveVelocity2.Execute := FALSE;
+            fbMoveVelocity1.Execute := TRUE;
+            _eActiveDirection       := stConfig.eActiveDirection;
+            
+            // Handshake & Status Supervision for Instance 1
+            IF fbMoveVelocity1.CommandAborted THEN
+                fbMoveVelocity1.Execute := FALSE;
+                _eCurrentState          := E_AxisState.HALTING;
+            ELSIF fbMoveVelocity1.Error THEN
+                _udiErrorId    := fbMoveVelocity1.ErrorID;
+                _eCurrentState := E_AxisState.ERROR;
+            END_IF
+        END_IF
+		
+	E_AxisState.JOGGING:
+        // --------------------------------------------------------------------------
+        // State: JOGGING (Manual Continuous Movement Mode)
+        // --------------------------------------------------------------------------
+        // Executes continuous manual axis positioning using the encapsulated MC_Jog block 
+        // operating in MC_JOGMODE_CONTINOUS.
+        //
+        // 1. Natural Standstill Deceleration: Releasing the jog button or triggering 
+        //    a conflict forces MC_Jog execute pins to FALSE. The state intentionally 
+        //    remains in JOGGING while MC_Jog executes its native deceleration ramp 
+        //    (lrJogDeceleration). Once xMoving becomes FALSE, it returns cleanly to IDLE.
+        // 2. Seamless Instant Reversals: Because it remains in JOGGING during ramp-down, 
+        //    if the operator instantly presses the opposite direction, MC_Jog naturally 
+        //    recalculates the trajectory without injecting an abrupt MC_Halt.
+        // --------------------------------------------------------------------------
+        xJogBkwActive := AxisCmd.xJogBkwFast OR AxisCmd.xJogBkwSlow;
+        xJogFwdActive := AxisCmd.xJogFwdFast OR AxisCmd.xJogFwdSlow;
+        
+        xJogBkwSpeedConflict := AxisCmd.xJogBkwFast AND AxisCmd.xJogBkwSlow;
+        xJogFwdSpeedConflict := AxisCmd.xJogFwdFast AND AxisCmd.xJogFwdSlow;
+        
+        // Safety & Conflict Guard: Reject simultaneous opposing directions or conflicting speeds
+        IF (xJogBkwActive AND xJogFwdActive) 
+           OR xJogBkwSpeedConflict 
+           OR xJogFwdSpeedConflict THEN
+            
+            fbJog.JogBackwards := FALSE;
+            fbJog.JogForward   := FALSE;
+            
+            // Wait for natural MC_Jog deceleration to finish before exiting
+            IF NOT AxisFeedback.xMoving THEN
+                _eCurrentState := E_AxisState.IDLE;
+            END_IF
+            
+        ELSIF AxisCmd.xJogBkwFast THEN
+            // Backward Fast Jog
+            fbJog.JogBackwards := TRUE;
+            fbJog.JogForward   := FALSE;
+            fbJog.Velocity     := stConfig.lrJogBkwFastVelocity;
+            fbJog.Acceleration := stConfig.lrJogAcceleration;
+            fbJog.Deceleration := stConfig.lrJogDeceleration;
+            fbJog.Jerk         := stConfig.lrJogJerk;
+            
+        ELSIF AxisCmd.xJogBkwSlow THEN
+            // Backward Slow Jog
+            fbJog.JogBackwards := TRUE;
+            fbJog.JogForward   := FALSE;
+            fbJog.Velocity     := stConfig.lrJogBkwSlowVelocity;
+            fbJog.Acceleration := stConfig.lrJogAcceleration;
+            fbJog.Deceleration := stConfig.lrJogDeceleration;
+            fbJog.Jerk         := stConfig.lrJogJerk;
+            
+        ELSIF AxisCmd.xJogFwdSlow THEN
+            // Forward Slow Jog
+            fbJog.JogForward   := TRUE;
+            fbJog.JogBackwards := FALSE;
+            fbJog.Velocity     := stConfig.lrJogFwdSlowVelocity;
+            fbJog.Acceleration := stConfig.lrJogAcceleration;
+            fbJog.Deceleration := stConfig.lrJogDeceleration;
+            fbJog.Jerk         := stConfig.lrJogJerk;
+
+        ELSIF AxisCmd.xJogFwdFast THEN
+            // Forward Fast Jog
+            fbJog.JogForward   := TRUE;
+            fbJog.JogBackwards := FALSE;
+            fbJog.Velocity     := stConfig.lrJogFwdFastVelocity;
+            fbJog.Acceleration := stConfig.lrJogAcceleration;
+            fbJog.Deceleration := stConfig.lrJogDeceleration;
+            fbJog.Jerk         := stConfig.lrJogJerk;
+            
+        ELSE
+            // Jog buttons released -> Drop pins, allow MC_Jog to brake naturally
+            fbJog.JogBackwards := FALSE;
+            fbJog.JogForward   := FALSE;
+            
+            // Wait for natural MC_Jog deceleration to finish before exiting
+            IF NOT AxisFeedback.xMoving THEN
+                _eCurrentState := E_AxisState.IDLE;
+            END_IF
+        END_IF
+        
+        // Jog profile aborted mid-travel (e.g. limit switch trip or NC-level command preemption)
+        IF fbJog.CommandAborted THEN
+            fbJog.JogBackwards := FALSE;
+            fbJog.JogForward   := FALSE;
+            _eCurrentState     := E_AxisState.HALTING;
+        
+        // Drive amplifier or NC kernel fault during manual jogging
+        ELSIF fbJog.Error THEN
+            _udiErrorId    := fbJog.ErrorID;
+            _eCurrentState := E_AxisState.ERROR;
+        END_IF
+	
+    E_AxisState.EXTERNAL_MOTION:
+        // --------------------------------------------------------------------------
+        // State: EXTERNAL_MOTION (TwinCAT NC Axis Online Tab & ADS Motion Tracking)
+        // --------------------------------------------------------------------------
+        // Active when physical movement is detected while resting in IDLE originating from 
+        // outside the PLC command architecture (specifically: commissioning engineers 
+        // manual jogging via F1–F4 hotkeys in the TwinCAT NC Axis Online tab, external 
+        // ADS trajectory generation, or moves triggered from the NC Functions tab).
+        //
+        // Operational Invariants:
+        // 1. Truthful Telemetry: Transparently publishes eCurrentState = EXTERNAL_MOTION 
+        //    so supervisory sequencers, cell interlocks, and dual-drive coordinators are 
+        //    never deceived into assuming the axis is stationary in IDLE.
+        // 2. Command Collision Sweeping: Forcefully asserts Execute := FALSE across all 
+        //    internal motion blocks to prevent PLC commands from colliding with or 
+        //    corrupting the external NC setpoint trajectory.
+        // 3. Autonomous Standstill Recovery: Once the commissioning engineer releases the 
+        //    NC Online tab jog keys and the NC confirms physical standstill (NOT AxisFeedback.xMoving), 
+        //    the controller returns automatically and cleanly to IDLE without nuisance faults.
+        // --------------------------------------------------------------------------
+        xToggleMoveAbs			:= FALSE;
+		xToggleMoveVelo		    := FALSE;
+		fbMoveAbsolute1.Execute := FALSE;
+        fbMoveAbsolute2.Execute := FALSE;
+        fbMoveVelocity1.Execute := FALSE;
+		fbMoveVelocity2.Execute := FALSE;
+        fbJog.JogBackwards      := FALSE;
+        fbJog.JogForward        := FALSE;
+        fbStop.Execute          := FALSE;
+        fbHalt.Execute          := FALSE;
+        fbHome.Execute          := FALSE;
+        fbReset.Execute         := FALSE;
+
+        // Return to Standby or Safe OFF based on active drive power status
+        IF NOT AxisFeedback.xMoving THEN
+            IF fbPower.Status THEN
+                _eCurrentState := E_AxisState.IDLE; 
+            ELSE
+                _eCurrentState := E_AxisState.OFF;  
+            END_IF
+        END_IF
+	
+    E_AxisState.HALTING:
+        // --------------------------------------------------------------------------
+        // State: HALTING (Controlled Deceleration with Abortive Preemption)
+        // --------------------------------------------------------------------------
+        // Commands the axis to decelerate to a standstill using the encapsulated MC_Halt 
+        // block configured with BufferMode := MC_Aborting.
+        //
+        // In-Flight Preemption (Mid-Way Override Capability):
+        // Unlike MC_Stop (which actively locks the axis and rejects new commands), MC_Halt 
+        // permits mid-flight trajectory overrides:
+        // 1. If a fresh absolute positioning move (fbPulsedCmdMoveAbs.Q), continuous velocity 
+        //    move (fbPulsedCmdMoveVelo.Q), or manual jog command arrives while the axis is 
+        //    decelerating, fbHalt.Execute is immediately dropped to FALSE.
+        // 2. The controller transitions directly into the requested motion state mid-ramp. 
+        //    The NC setpoint generator smoothly recalculates the trajectory from the active 
+        //    deceleration velocity without waiting for standstill, eliminating cycle latency.
+        // 3. If no motion overrides are commanded, the axis completes its deceleration ramp 
+        //    to 0.0 mm/s (fbHalt.Done = TRUE) and returns cleanly to IDLE.
+        // --------------------------------------------------------------------------
+        fbHalt.Execute := TRUE;
+        
+        // Dynamic In-Flight Motion Overrides (Aborting buffer mode permits preemption)
+        IF fbPulsedCmdMoveAbs.Q AND NOT xMotionInterlock THEN
+            fbHalt.Execute := FALSE;
+            _eCurrentState := E_AxisState.MOVEABS;
+            
+        ELSIF fbPulsedCmdMoveVelo.Q AND NOT xMotionInterlock AND NOT (stConfig.eActiveDirection = MC_Undefined_Direction) THEN
+            fbHalt.Execute := FALSE;
+            _eCurrentState := E_AxisState.MOVEVELO;
+            
+        // Standstill reached successfully without preemption; return to Standby
+        ELSIF fbHalt.Done THEN
+            _eCurrentState := E_AxisState.IDLE;
+            
+        // Halt deceleration was aborted by an unexpected external NC command
+        ELSIF fbHalt.CommandAborted THEN
+            _udiErrorId    := TO_UDINT(E_AxisError.ERR_HALT_ABORTED);
+            _eCurrentState := E_AxisState.ERROR;
+            
+        // Drive amplifier or NC kernel deceleration fault
+        ELSIF fbHalt.Error THEN
+            _udiErrorId    := fbHalt.ErrorID;
+            _eCurrentState := E_AxisState.ERROR;
+        END_IF
+    
+    E_AxisState.STOPPING:
+        // --------------------------------------------------------------------------
+        // State: STOPPING (High-Priority Controlled Standstill & Setpoint Lock)
+        // --------------------------------------------------------------------------
+        // Commands the axis to decelerate to a standstill using the encapsulated MC_Stop block.
+        // Stop outranks Halt in the motion hierarchy; while active, it locks the axis setpoint 
+        // generator in the NC Stopping state and actively rejects any new motion commands.
+        //
+        // Caller Intent Arbitration vs. Hardware Resynchronization:
+        // Recovery states (RESET, ERROR Path 2, EXTERNAL_MOTION) must inspect fbPower.Status 
+        // to discover whether hardware power survived an external trip or tool intervention. 
+        // In contrast, STOPPING is a deterministic PLC sequence that deliberately holds 
+        // fbPower.Enable := TRUE throughout deceleration to guarantee active braking torque. 
+        // Consequently, when fbStop.Done fires, fbPower.Status is guaranteed to be TRUE. 
+        // Therefore, exiting STOPPING does not poll hardware power; it arbitrates caller intent:
+        //
+        // 1. Branch 1 (Software Disable Request): If the stop was triggered by Priority 2B 
+        //    (NOT AxisCmd.xPowerEnable), the caller's intent was to shut down power. Once 
+        //    verified at 0.0 mm/s, it transitions directly to OFF so fbPower.Enable drops 
+        //    to FALSE safely without drivetrain shock or NC Error 16992.
+        // 2. Branch 2 (Operational Motion Stop): If power is intact (AxisCmd.xPowerEnable = TRUE), 
+        //    the stop was an operational halt. Under PLCopen rules, MC_Stop is level-triggered 
+        //    and actively locks the axis. As long as AxisCmd.xStop is held TRUE, the axis 
+        //    remains locked in STOPPING. Only when released (NOT AxisCmd.xStop) does it return to IDLE.
+        // --------------------------------------------------------------------------
+        fbStop.Execute := TRUE;
+        
+        // Standstill confirmed by NC kernel setpoint generator
+        IF fbStop.Done THEN
+            // Branch 1: Ingress intent was software power disable -> Safe de-energization at 0.0 mm/s
+            IF NOT AxisCmd.xPowerEnable THEN
+                _eCurrentState := E_AxisState.OFF;
+                
+            // Branch 2: Ingress intent was operational stop -> Wait for command release before IDLE
+            ELSIF NOT AxisCmd.xStop THEN
+                _eCurrentState := E_AxisState.IDLE;
+            END_IF
+            
+        // Stop profile was unexpectedly aborted by external NC kernel preemption
+        ELSIF fbStop.CommandAborted THEN
+            _udiErrorId    := TO_UDINT(E_AxisError.ERR_STOP_ABORTED);
+            _eCurrentState := E_AxisState.ERROR; 
+            
+        // Drive amplifier or NC kernel stop profile fault
+        ELSIF fbStop.Error THEN
+            _udiErrorId    := fbStop.ErrorID;
+            _eCurrentState := E_AxisState.ERROR;
+        END_IF
+    
+    E_AxisState.GEARED:
+        // --------------------------------------------------------------------------
+        // State: GEARED (Synchronized Slave Tracking & NC Online Decouple Guard)
+        // --------------------------------------------------------------------------
+        // Passive operational state indicating that the axis is electronically locked 
+        // to a master axis trajectory in the NC setpoint generator via MC_GearIn.
+        //
+        // Operational Invariants:
+        // 1. Structural Motion Lockout: By state machine design, this state contains no 
+        //    transition paths for positioning, jogging, or homing commands. Independent 
+        //    trajectory generation is structurally locked out so the slave strictly follows 
+        //    the master's motion profile, preventing NC Error 0x435A.
+        // 2. NC Online Tab Desynchronization Guard: Monitors live telemetry (AxisFeedback.xInGear). 
+        //    If a commissioning engineer manually decouples the axis directly from the 
+        //    TwinCAT NC Axis Online tab or via external ADS, the uncoupling occurs at the 
+        //    kernel level without issuing a PLC GearOut command. Monitoring xInGear detects 
+        //    this transition immediately and returns the controller safely to IDLE, 
+        //    preventing the software model from becoming permanently stranded in GEARED.
+        // --------------------------------------------------------------------------
+        IF NOT AxisFeedback.xInGear THEN
+            _eCurrentState := E_AxisState.IDLE;
+        END_IF
+    
+    E_AxisState.RESET:
+        // --------------------------------------------------------------------------
+        // State: RESET (Error Acknowledgment & Dual-Domain Fault Recovery)
+        // --------------------------------------------------------------------------
+        // Clears axis faults by arbitrating between internal PLC software errors 
+        // and NC kernel / drive hardware trips.
+        //
+        // 1. Software-Only Fault Recovery (NC Kernel Healthy):
+        // If the error was generated purely in PLC software (e.g. ERR_POWER_TIMEOUT, 
+        // ERR_HALT_ABORTED), the NC kernel is healthy (AxisFeedback.xError = FALSE). 
+        // Calling MC_Reset against a healthy NC axis violates PLCopen specifications and 
+        // causes the NC kernel to reject the command with ADS Error 0x707 (Device Not Ready). 
+        // Branch 1 bypasses MC_Reset entirely, clears _udiErrorId, and transitions immediately 
+        // to IDLE (if energized) or OFF.
+        //
+        // 2. NC Hardware / Drive Fault Recovery (MC_Reset Execution):
+        // Active NC faults (AxisFeedback.xError = TRUE) execute the encapsulated MC_Reset block 
+        // to clear drive amplifier alarms and NC error registers.
+        //
+        // Task Synchronization Handshake:
+        // Exiting Branch 2 strictly requires both fbReset.Done AND NOT AxisFeedback.xError. 
+        // This ensures the NC-SAF task has written its updated error-free process image 
+        // to PLC cyclic memory before the controller resumes operational readiness, 
+        // eliminating false re-trips caused by cycle timing latency.
+        // fbReset.Execute is dropped to FALSE immediately upon Done or Error.
+        // --------------------------------------------------------------------------
+        
+        // Branch 1: PLC Software-Only Fault (NC Kernel is completely healthy)
+        IF NOT AxisFeedback.xError THEN
+            fbReset.Execute := FALSE;
+            
+            // Refuse to clear if configuration invariants are still invalid
+            IF udiConfigErrorId <> 0 THEN
+                _eCurrentState := E_AxisState.ERROR;
+				_udiErrorId    := udiConfigErrorId;
+            ELSE
+                _udiErrorId := 0; // Cleared upon successful reset
+                
+                // If still decelerating from a software stop, finish ramp in STOPPING
+                IF AxisFeedback.xMoving THEN
+                    _eCurrentState := E_AxisState.STOPPING;
+                ELSIF fbPower.Status THEN
+                    _eCurrentState := E_AxisState.IDLE;
+                ELSE
+                    _eCurrentState := E_AxisState.OFF;
+                END_IF
+            END_IF
+
+        // Branch 2: NC Kernel / Drive Hardware Fault
+        ELSE
+            fbReset.Execute := TRUE;
+            
+            // Handshake: MC_Reset reported Done AND cyclic image confirms fault cleared
+            IF fbReset.Done AND NOT AxisFeedback.xError THEN
+                fbReset.Execute := FALSE;     
+                
+                IF fbPower.Status THEN
+                    _eCurrentState := E_AxisState.IDLE;
+                ELSE
+                    _eCurrentState := E_AxisState.OFF;
+                END_IF
+                
+                _udiErrorId     := 0; // Cleared only upon successful exit
+            
+            // Reset command rejected or faulted by NC kernel
+            ELSIF fbReset.Error THEN
+                fbReset.Execute := FALSE;
+                _udiErrorId    := fbReset.ErrorID; 
+                _eCurrentState := E_AxisState.ERROR;
+            END_IF
+        END_IF
+    
+    E_AxisState.ERROR:
+        // --------------------------------------------------------------------------
+        // State: ERROR (Universal Fault State, Command Sweeping & Recovery Sync)
+        // --------------------------------------------------------------------------
+        // Triggered by NC kernel faults, drive hardware alarms, PLCopen block errors, 
+        // or internal software timeouts.
+        //
+        // Operational Mechanics:
+        // 1. Closed-Loop Torque Retention: Intentionally maintains fbPower.Enable := TRUE 
+        //    to preserve holding torque during soft faults (e.g. following errors, soft limits). 
+        //    If a true hardware power cut or STO trip occurs, top-level Priority 2A forces OFF.
+        // 2. Command Sweeping: Forcefully de-asserts execution signals across all motion blocks 
+        //    and resets xToggleMoveAbs to FALSE. This unlatches all edge-triggered blocks so 
+        //    they are primed to register fresh rising edges once the axis is recovered.
+        // 3. Recovery Pathways:
+        //    - Path 1 (Standard Software Recovery): Consumes an explicit rising edge from the 
+        //      operator (fbPulsedCmdReset.Q) to route into the active RESET sequence.
+        //    - Path 2 (External NC Online Tab / ADS Reset Synchronization): Commissioning engineers 
+        //      frequently clear faults directly in the TwinCAT NC Axis Online tab (F8 hotkey) or 
+        //      via ADS diagnostic tools. Path 2 detects the falling edge (fbNcErrorFallingEdge.Q) 
+        //      when the NC clears externally, resynchronizing the controller directly to IDLE 
+        //      or OFF without leaving it stranded in ERROR.
+        // 4. Software Fault Deceleration Guard: If an internal software fault occurs while 
+        //    the axis is moving, commands an active stop to decelerate to 0.0 mm/s, preventing 
+        //    coasting when the NC kernel itself has not tripped into ErrorStop.
+        //
+        // The Static-Level Trap vs. Falling-Edge Synchronization:
+        // A naive check (ELSIF NOT AxisFeedback.xError) would create a critical timing bug 
+        // for internal software errors (e.g. ERR_POWER_TIMEOUT). Because software errors do not 
+        // trip the NC kernel, AxisFeedback.xError is FALSE throughout. A static check would see 
+        // NOT xError = TRUE on the very next scan cycle and silently auto-clear the software fault 
+        // in 1 cycle, making it invisible to the operator. By checking fbNcErrorFallingEdge.Q, 
+        // Path 2 strictly detects the active transition where an NC fault was present (TRUE) 
+        // and cleared to healthy (FALSE).
+        // --------------------------------------------------------------------------
+        xToggleMoveAbs          := FALSE;
+		xToggleMoveVelo         := FALSE;
+        fbMoveAbsolute1.Execute := FALSE;
+        fbMoveAbsolute2.Execute := FALSE;
+        fbMoveVelocity1.Execute := FALSE;
+		fbMoveVelocity2.Execute := FALSE;
+        fbJog.JogBackwards      := FALSE;
+        fbJog.JogForward        := FALSE;
+        fbHalt.Execute          := FALSE;
+        fbHome.Execute          := FALSE;
+        fbReset.Execute         := FALSE;
+    
+        // Active stop guard: decelerates moving axes to standstill during software-only faults
+        IF AxisFeedback.xMoving AND NOT AxisFeedback.xError THEN
+            fbStop.Execute := TRUE;
+        ELSE
+            fbStop.Execute := FALSE;
+        END_IF
+    
+        // Path 1: Operator / Sequencer Reset Command (Requires deliberate rising edge)
+        IF fbPulsedCmdReset.Q THEN
+            _eCurrentState := E_AxisState.RESET;
+
+        // Path 2: External NC Online Tab / ADS Reset Synchronization (Falling Edge Guard)
+        ELSIF fbNcErrorFallingEdge.Q THEN
+            fbStop.Execute := FALSE;
+            IF fbPower.Status THEN
+                _eCurrentState := E_AxisState.IDLE; 
+            ELSE
+                _eCurrentState := E_AxisState.OFF;  
+            END_IF
+            
+            _udiErrorId := 0; // Cleared only upon successful exit
+        END_IF
+    
+END_CASE
+
+// ==============================================================================
+// 5. DECOUPLED MOTION FUNCTION BLOCK EXECUTION
+// ==============================================================================
+// Architectural Invariant (Decoupled Execution Pattern):
+// In professional IEC 61131-3 motion control, PLCopen function blocks must be invoked 
+// unconditionally every PLC scan cycle at the bottom of the routine, outside the CASE structure.
+//
+// 1. Execution State Machine Integrity: Calling function blocks conditionally inside CASE 
+//    branches freezes their internal background state processing when the branch is not active. 
+//    Unconditional cyclic invocation ensures that internal edge detectors, ADS communication 
+//    mailboxes, task synchronization handshakes, and diagnostic registers evaluate continuously.
+// 2. Clear Separation of Concerns: The state machine above strictly arbitrates operational 
+//    intent (setting inputs, dynamics, and execution triggers). The decoupled block calls 
+//    below strictly process the NC cyclic communication interface every scan.
+// ==============================================================================
+fbPower(
+    Axis            := Axis,
+    Enable_Positive := xEnablePositive,
+    Enable_Negative := xEnableNegative
+);
+
+fbReset(
+    Axis            := Axis
+);
+
+fbMoveAbsolute1(
+    Axis            := Axis,
+    Position        := stConfig.lrTargetPosition,
+    Velocity        := stConfig.lrMaxVelocity,
+    Acceleration    := stConfig.lrMaxAcceleration,
+    Deceleration    := stConfig.lrMaxDeceleration,
+    Jerk            := stConfig.lrMaxJerk,
+    BufferMode      := MC_Aborting 
+);
+
+fbMoveAbsolute2(
+    Axis            := Axis,
+    Position        := stConfig.lrTargetPosition,
+    Velocity        := stConfig.lrMaxVelocity,
+    Acceleration    := stConfig.lrMaxAcceleration,
+    Deceleration    := stConfig.lrMaxDeceleration,
+    Jerk            := stConfig.lrMaxJerk,
+    BufferMode      := MC_Aborting 
+);
+
+fbMoveVelocity1(
+    Axis            := Axis,
+    Velocity        := stConfig.lrMaxVelocity,
+    Acceleration    := stConfig.lrMaxAcceleration,
+    Deceleration    := stConfig.lrMaxDeceleration,
+    Jerk            := stConfig.lrMaxJerk,
+    Direction       := stConfig.eActiveDirection,
+    BufferMode      := MC_Aborting 
+);
+
+fbMoveVelocity2(
+    Axis            := Axis,
+    Velocity        := stConfig.lrMaxVelocity,
+    Acceleration    := stConfig.lrMaxAcceleration,
+    Deceleration    := stConfig.lrMaxDeceleration,
+    Jerk            := stConfig.lrMaxJerk,
+    Direction       := stConfig.eActiveDirection,
+    BufferMode      := MC_Aborting 
+);
+
+fbJog(
+    Axis            := Axis,
+    Mode            := MC_JOGMODE_CONTINOUS
+);
+
+fbStop(
+    Axis            := Axis,
+    Deceleration    := stConfig.lrStopDeceleration,
+    Jerk            := stConfig.lrStopJerk
+);
+
+fbHalt(
+    Axis            := Axis,
+    Deceleration    := stConfig.lrHaltDeceleration,
+    Jerk            := stConfig.lrHaltJerk,
+    BufferMode      := MC_Aborting
+);
+
+fbHome(
+    Axis            := Axis,
+    Position        := stConfig.lrHomePosition,
+    HomingMode      := stConfig.eHomingMode,
+    BufferMode      := MC_Aborting,
+    bCalibrationCam := xCalibrationCam
+);    
+
+// ==============================================================================
+// 6. DIAGNOSTIC EGRESS & TELEMETRY MAPPING
+// ==============================================================================
+// Gathers internal state machine registers and writes them atomically to write-only 
+// public VAR_OUTPUTs at the cycle boundary.
+//
+// Fault Telemetry Capture:
+// 1. Evaluates _xError strictly based on the operational state (_eCurrentState = E_AxisState.ERROR).
+// 2. If the error originated directly in the drive hardware or NC kernel (e.g. following error, 
+//    encoder fault) without an internal PLC block error, the NC fault code from AxisFeedback.udiErrorId 
+//    is captured into _udiErrorId.
+// 3. _udiErrorId is intentionally preserved across multi-cycle recovery (RESET) and is zeroed 
+//    exclusively upon verified arrival in IDLE or OFF.
+// ==============================================================================
+_xError := (_eCurrentState = E_AxisState.ERROR);
+
+// Capture NC kernel fault code if not already assigned by an internal FB or software timeout
+IF _xError AND (_udiErrorId = 0) AND AxisFeedback.xError THEN
+    _udiErrorId := AxisFeedback.udiErrorId;
+END_IF
+
+// Atomic 1-to-1 write to public output pins at cycle boundary
+eCurrentState    := _eCurrentState;
+eActiveDirection := _eActiveDirection;
+xError           := _xError;
+udiErrorId       := _udiErrorId;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

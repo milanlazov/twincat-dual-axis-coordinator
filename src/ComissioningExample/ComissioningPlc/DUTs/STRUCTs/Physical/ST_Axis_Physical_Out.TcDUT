@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_Axis_Physical_Out" Id="{3d1f93b4-3027-42f3-b2cd-bbe8ac07a288}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_Axis_Physical_In
+// Description:    Hardware digital output signals driving panel indicators, pilot lamps, or field actuators.
+// ==============================================================================
+TYPE ST_Axis_Physical_Out :
+STRUCT
+    // Reserved for field hardware outputs (e.g., status pilot lamps, mechanical brake coils)
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

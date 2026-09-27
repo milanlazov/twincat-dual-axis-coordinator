@@ -1,0 +1,85 @@
+# ==============================================================================
+# SECTION 1: Visual Studio & TwinCAT XAE Shell User Workspace
+# ==============================================================================
+.vs/
+*.suo
+*.user
+*.user.*
+*.sln.docstates
+*.ide
+*.tcatuser
+
+# Temporary and Lock Files (CRITICAL: Catches ~u and project.~u during editing)
+*.~u
+*.project.~u
+~*.*
+*.tmp
+
+# ==============================================================================
+# SECTION 2: TwinCAT 3 PLC & NC Runtime Build Artifacts
+# ==============================================================================
+# Compiler output directories and boot code
+_Boot/
+_CompileInfo*/
+_Libraries/
+
+# Compiler debug line maps and symbol exports
+LineIDs.dbg
+LineIDs.dbg.bak
+*.dbg
+*.tpy
+*.tclrs
+*.compileinfo
+
+# Scope and measurement recordings (prevents multi-megabyte binary commits)
+*.svd
+*.svz
+
+# ==============================================================================
+# SECTION 3: TwinCAT Project Backups & Local Caches
+# ==============================================================================
+*.bak
+*.orig
+*.tsproj.bak
+*.plcproj.bak
+*.xti.bak
+*.tcmproj.bak
+*.[Cc]ompiled-library.bak
+LineControl.xml
+
+# ==============================================================================
+# SECTION 4: TwinCAT HMI (TF2000 / TE2000) Build, Server & Cache Files
+# ==============================================================================
+# Engineering server and live preview caches (Local test runtime)
+.engineering_servers/
+**/Live-View/
+**/liveview_*
+json-schema.org
+
+# Dependency packages and compiler build outputs
+**/packages/
+**/node_modules/
+**/bin/
+**/obj/
+
+# HMI Server Runtime Storage & SQLite Transaction Logs
+*.Storage.json
+*.Storage.json.*
+*.db-shm
+*.db-wal
+*.pid
+
+# Deployment & Publishing artifacts
+*.publish.xml
+*.pubxml
+*.pubxml.user
+*.crx
+tchmipublish.journal.json
+
+# ==============================================================================
+# SECTION 5: Operating System Metadata
+# ==============================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisInterface" Id="{71e80952-6a17-4556-8c8e-44a2846004c8}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_AxisInterface
+// Description:    Commissioning & VISU composite interface structure. Combines 
+//                 HMI commands and live status telemetry into a single axis node.
+// ==============================================================================
+TYPE ST_AxisInterface :
+STRUCT
+    // Asynchronous operator command inputs originating from visualization elements
+    stHmiCmd    : ST_AxisHmiCmd;
+
+    // Consolidated status, kinematic feedback, and diagnostics bound to visualization elements
+    stHmiStatus : ST_AxisHmiStatus;
+	
+	// Kinematic dynamics, jog limits, and timeouts for the axis
+	stConfig 	: ST_AxisConfig; 
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

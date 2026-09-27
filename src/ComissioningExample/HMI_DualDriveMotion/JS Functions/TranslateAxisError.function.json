@@ -1,0 +1,40 @@
+{
+  "$schema": "./../Packages/Beckhoff.TwinCAT.HMI.Framework.14.6.3/runtimes/native1.12-tchmi/Schema/FunctionDescription.Schema.json",
+  "apiVersion": 1,
+  "version": {
+    "full": "0.0.0.0",
+    "major": 0,
+    "minor": 0,
+    "revision": 0,
+    "build": 0
+  },
+  "dependencyFiles": [
+    {
+      "name": "TranslateAxisError.js",
+      "type": "EsModule",
+      "description": ""
+    }
+  ],
+  "function": {
+    "name": "TranslateAxisError",
+    "namespace": "TcHmi.Functions.HMI_DualDriveMotion",
+    "displayName": "TranslateAxisError",
+    "description": "",
+    "waitMode": "Synchronous",
+    "category": "",
+    "returnValue": {
+      "type": "tchmi:general#/definitions/String"
+    },
+    "arguments": [
+      {
+        "name": "par1",
+        "displayName": "Parameter",
+        "type": "tchmi:general#/definitions/Number",
+        "description": "This is an important Parameter which does... This text is used in a tooltip.",
+        "defaultValue": null,
+        "required": true,
+        "bindable": true
+      }
+    ]
+  }
+}

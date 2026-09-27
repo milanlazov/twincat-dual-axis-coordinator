@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <GVL Name="GVL_Motion" Id="{23fa11ea-3a9b-4a57-a9e1-37d39bdf8bf0}">
+    <Declaration><![CDATA[// ==============================================================================
+// GVL:            GVL_Motion
+// Description:    Global variable list instantiating TwinCAT NC axis hardware 
+//                 references (AXIS_REF) and composite HMI visualization nodes.
+// ==============================================================================
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    // --- Master Motion Axis ---
+    Axis_M               : AXIS_REF;               // TwinCAT NC axis reference for Master axis
+    Axis_M_Interface     : ST_AxisInterface;       // Visualization interface node for Master axis
+    
+    // --- Slave Motion Axis ---
+    Axis_S               : AXIS_REF;               // TwinCAT NC axis reference for Slave axis
+    Axis_S_Interface     : ST_AxisInterface;       // Visualization interface node for Slave axis
+
+    // --- Dual-Drive Coordination Module ---
+    DualDrive_Interface  : ST_DualDriveInterface;  // Visualization interface node for Dual-Drive equipment module
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>

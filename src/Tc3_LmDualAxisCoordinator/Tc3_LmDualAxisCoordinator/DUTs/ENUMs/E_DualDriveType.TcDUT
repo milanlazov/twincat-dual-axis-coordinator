@@ -1,0 +1,26 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_DualDriveType" Id="{4c9fa5d7-a9b7-4f0c-9deb-b47e444109ba}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            E_DualDriveType
+// Version:        1.0.0.0
+// ==============================================================================
+/// Mechanical pairing topologies and preset gear ratio configurations for dual-axis drives.
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_DualDriveType :
+(
+    /// Opposing motion with fixed -1.0 ratio (e.g. center-opening doors or symmetric clamps).
+    BI_PARTING := 0,
+
+    /// Differential speed motion with fixed 2.0 ratio (e.g. telescopic stages).
+    TELESCOPIC := 1,
+
+    /// User-defined ratio resolved dynamically via numerator and denominator inputs.
+    CUSTOM     := 2
+);
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,94 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_AxisInputMapping" Id="{e0b193e7-a85a-4a54-892b-7cf94f4bc82d}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// POU:            FB_AxisInputMapping
+// Description:    Commissioning & VISU helper block. Combines parallel HMI 
+//                 visualization commands and physical panel pushbuttons into 
+//                 a unified ST_AxisSystemCmd structure for axis controllers.
+// ==============================================================================
+FUNCTION_BLOCK FB_AxisInputMapping
+VAR_IN_OUT CONSTANT
+    // Read-only reference to asynchronous commands coming from the HMI screen
+    stHmiCmd      : ST_AxisHmiCmd;
+
+    // Read-only reference to hardwired pushbuttons and physical panel inputs
+    stPhysicalIn  : ST_Axis_Physical_In;
+END_VAR
+
+VAR_OUTPUT
+    // Conditioned internal command structure dispatched to FB_AxisController or FB_AxisDualDrive
+    stSystemCmd   : ST_AxisSystemCmd;
+END_VAR
+
+VAR
+    // Edge-conditioning instances to generate single-cycle execution pulses from HMI/panel signals
+    fbCmdMoveAbs  : FB_InputEdgeDetection; // Filters absolute move requests into a 1-cycle pulse
+    fbCmdMoveVelo : FB_InputEdgeDetection; // Filters velocity move requests into a 1-cycle pulse
+    fbCmdHalt     : FB_InputEdgeDetection; // Filters halt requests into a 1-cycle pulse
+    fbCmdHome     : FB_InputEdgeDetection; // Filters homing calibration requests into a 1-cycle pulse
+    fbCmdReset    : FB_InputEdgeDetection; // Filters error reset requests into a 1-cycle pulse
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ==============================================================================
+// 1. PULSED MOTION COMMAND CONDITIONING (EDGE-TRIGGERED)
+// ==============================================================================
+// Evaluates HMI and physical pushbuttons in parallel. Passes signals through
+// FB_InputEdgeDetection instances to ensure that sustained presses or latched
+// buttons produce exactly one execution pulse on the outgoing command pipeline.
+
+// Absolute Positioning Command
+fbCmdMoveAbs(
+    xHmiInput      := stHmiCmd.xMoveAbs,
+    xPhysicalInput := stPhysicalIn.xMoveAbsBtn
+);  
+stSystemCmd.xMoveAbs := fbCmdMoveAbs.xPulsedCmd;
+
+// Continuous Velocity Command
+fbCmdMoveVelo(
+    xHmiInput      := stHmiCmd.xMoveVelo,
+    xPhysicalInput := stPhysicalIn.xMoveVeloBtn
+);  
+stSystemCmd.xMoveVelo := fbCmdMoveVelo.xPulsedCmd;
+
+// Controlled Halt Command
+fbCmdHalt(
+    xHmiInput      := stHmiCmd.xHalt,
+    xPhysicalInput := stPhysicalIn.xHaltBtn
+);  
+stSystemCmd.xHalt := fbCmdHalt.xPulsedCmd;
+
+// Axis Calibration / Homing Command
+fbCmdHome(
+    xHmiInput      := stHmiCmd.xHome,
+    xPhysicalInput := stPhysicalIn.xHomeBtn
+);  
+stSystemCmd.xHome := fbCmdHome.xPulsedCmd;
+
+// Fault Reset Command
+fbCmdReset(
+    xHmiInput      := stHmiCmd.xReset,
+    xPhysicalInput := stPhysicalIn.xResetBtn
+);  
+stSystemCmd.xReset := fbCmdReset.xPulsedCmd;
+
+// ==============================================================================
+// 2. CONTINUOUS & INTERLOCK COMMAND MAPPING (LEVEL-TRIGGERED)
+// ==============================================================================
+// Evaluated directly without edge detection. These signals represent operational 
+// states or sustained operator holds that must persist across scan cycles.
+
+// Operational Stop (Asserted as long as either HMI stop or physical stop button is active)
+stSystemCmd.xStop        := stHmiCmd.xStop OR stPhysicalIn.xStopBtn;
+
+// Software Power Enable (Direct mapping from HMI enable toggle or physical enable button)
+stSystemCmd.xPowerEnable := stHmiCmd.xPowerEnable OR stPhysicalIn.xPowerEnableBtn;
+
+// Manual Jogging Vectors (Active while operator maintains button press)
+stSystemCmd.xJogBkwFast  := stHmiCmd.xJogBkwFast OR stPhysicalIn.xJogBkwFastBtn;
+stSystemCmd.xJogBkwSlow  := stHmiCmd.xJogBkwSlow OR stPhysicalIn.xJogBkwSlowBtn;
+stSystemCmd.xJogFwdSlow  := stHmiCmd.xJogFwdSlow OR stPhysicalIn.xJogFwdSlowBtn;
+stSystemCmd.xJogFwdFast  := stHmiCmd.xJogFwdFast OR stPhysicalIn.xJogFwdFastBtn;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

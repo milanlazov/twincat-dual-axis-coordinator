@@ -1,0 +1,26 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_DualDriveCouplingPolicy" Id="{3361ecc1-3ee2-45fd-84e7-562493fc3389}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            E_DualDriveCouplingPolicy
+// Version:        1.0.0.0
+// ==============================================================================
+/// Operational coordination and safety policies for dual-axis drive pairs.
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_DualDriveCouplingPolicy :
+(
+    /// Rigid pairing: retains coupling across power cycles, enforces tandem stopping and unified power.
+    PERSISTENT_TANDEM   := 0,
+
+    /// Dynamic pairing: decouples on disable, enforces tandem stopping, and allows independent power.
+    MODULAR_TANDEM_STOP := 1,
+
+    /// Dynamic pairing: decouples on disable, permits autonomous master motion, and allows independent power.
+    MODULAR_INDEPENDENT := 2
+);
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

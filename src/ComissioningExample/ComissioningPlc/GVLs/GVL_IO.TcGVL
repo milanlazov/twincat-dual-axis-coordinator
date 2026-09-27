@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <GVL Name="GVL_IO" Id="{7eeb9aed-a2e3-41ee-baba-23a655bf1460}">
+    <Declaration><![CDATA[// ==============================================================================
+// GVL:            GVL_IO
+// Description:    Global variable list mapping physical fieldbus process inputs 
+//                 from digital terminal slices (%I*) for master and slave axes.
+// ==============================================================================
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    // Hardware digital input images linked to terminal slice channels (%I*)
+    stMaster_Physical_In AT %I* : ST_Axis_Physical_In; // Master axis physical pushbuttons and panel switches
+    stSlave_Physical_In  AT %I* : ST_Axis_Physical_In; // Slave axis physical pushbuttons and panel switches
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>

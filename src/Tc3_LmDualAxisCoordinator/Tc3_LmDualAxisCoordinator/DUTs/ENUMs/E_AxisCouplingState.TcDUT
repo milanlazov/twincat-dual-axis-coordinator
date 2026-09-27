@@ -1,0 +1,33 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_AxisCouplingState" Id="{ae050431-ce81-4d24-988a-a2bcd8a7c210}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            E_AxisCouplingState
+// Version:        1.0.0.0
+// ==============================================================================
+/// Operational coupling states for master-slave axis coordination and synchronization tracking.
+{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE E_AxisCouplingState :
+(
+    /// Axis operates independently and is not coupled to a master setpoint trajectory.
+    UNSYNCED    := 0,
+
+    /// Axis is actively executing the MC_GearIn setpoint engagement process.
+    GEARING_IN  := 1,
+
+    /// Axis is actively executing the MC_GearOut setpoint disengagement process.
+    GEARING_OUT := 2,
+
+    /// Axis setpoint generator is locked and synchronized to the master axis trajectory.
+    SYNCED      := 3,
+
+    /// Gearing or uncoupling sequence encountered a fault, abort, or configuration error.
+    ERROR       := 4
+);
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

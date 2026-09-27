@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisHmiStatus" Id="{8cdbe794-aab8-47eb-baac-70ce80550bcf}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_AxisHmiStatus
+// Description:    Commissioning & VISU helper structure. Aggregates live axis
+//                 states, diagnostic error codes, and kinematic process data
+//                 for visualization displays and indicators.
+// ==============================================================================
+{attribute 'TcReadOnly'}
+TYPE ST_AxisHmiStatus :
+STRUCT
+    // --- Discrete Status Indicators ---
+    xPowerActive  : BOOL;        // Drive power stage is active and holding torque
+    xReady        : BOOL;        // Axis is operational and ready to accept commands
+    xMoving       : BOOL;        // Axis is physically in motion
+    xInPosition   : BOOL;        // Target coordinate reached within tolerance window
+    xError        : BOOL;        // Consolidated fault indicator
+	
+    // --- State Tracking & Diagnostics ---
+    eCurrentState : E_AxisState; // Active operational state of the axis controller
+	xInGear		  : BOOL;        // Slave axis is synchronized to master axis
+	udiErrorId    : UDINT;       // Active diagnostic error code (0 if healthy)
+	
+	
+    // --- Live Kinematic Process Data ---
+    lrActPos      : LREAL;       // Actual position feedback from encoder
+    lrActVel      : LREAL;       // Actual velocity feedback from axis
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,58 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_InputEdgeDetection" Id="{25bba1ec-a9b0-44d3-9e87-14e420e2042e}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           16.09.2026
+// POU:            FB_InputEdgeDetection
+// Version:        1.0.0.0
+// ==============================================================================
+/// Converts incoming HMI and physical push button signals into a clean, single-cycle execution pulse.
+//
+// Operational Architecture & Features:
+// - Parallel Signal Conditioning: Evaluates HMI and physical panel inputs in parallel.
+// - Edge Isolation: Passes each channel through an independent R_TRIG to guarantee a 
+//   single-cycle pulse output, regardless of whether inputs are momentary or held (latched).
+// - Anti-Contention: Holding one button TRUE does not inhibit or block rising edges on the other.
+FUNCTION_BLOCK FB_InputEdgeDetection
+VAR_INPUT
+    /// Virtual command signal from the HMI screen (momentary or latched).
+    /// Triggers an output pulse on its rising edge (FALSE to TRUE).
+    xHmiInput          : BOOL;
+
+    /// Physical command signal from the push button (momentary or latched).
+    /// Triggers an output pulse on its rising edge (FALSE to TRUE).
+    xPhysicalInput     : BOOL;
+END_VAR
+
+VAR_OUTPUT
+    /// One-cycle execution pulse (TRUE for exactly one PLC scan).
+    /// Fires on a rising edge from either input channel; clears automatically on the next scan.
+    xPulsedCmd         : BOOL;
+END_VAR
+
+VAR
+    // Dedicated channel edge detectors to allow independent edge tracking
+    fbTrigPhysical     : R_TRIG; // Edge detector for the physical input channel
+    fbTrigHmi          : R_TRIG; // Edge detector for the HMI input channel
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ==============================================================================
+// 1. INDEPENDENT CHANNEL EDGE EVALUATION
+// ==============================================================================
+// Evaluates rising edges (FALSE to TRUE) on each channel independently.
+// Dedicated edge detectors guarantee that if one channel is held TRUE (e.g. a latched 
+// HMI toggle or stuck panel button), subsequent rising edges on the alternate channel 
+// are still captured and produce an execution pulse.
+fbTrigPhysical(CLK := xPhysicalInput);
+fbTrigHmi     (CLK := xHmiInput);
+
+// ==============================================================================
+// 2. UNIFIED PULSE GENERATION
+// ==============================================================================
+// Combines single-scan output pulses from both channels via OR logic.
+// Evaluates TRUE for exactly one PLC scan cycle whenever either source transitions.
+xPulsedCmd := fbTrigPhysical.Q OR fbTrigHmi.Q;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

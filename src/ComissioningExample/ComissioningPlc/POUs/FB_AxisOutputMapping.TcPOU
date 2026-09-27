@@ -1,0 +1,55 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_AxisOutputMapping" Id="{f2ebda73-696f-4f2a-8f17-42fb43c0e1d0}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// POU:            FB_AxisOutputMapping
+// Description:    Commissioning & VISU helper block. Packs live axis controller
+//                 states, diagnostic fault codes, and cyclic NC feedback into 
+//                 the ST_AxisHmiStatus structure for visualization displays.
+// ==============================================================================
+FUNCTION_BLOCK FB_AxisOutputMapping
+VAR_INPUT
+    // Operational state machine state reported by FB_AxisController or FB_AxisDualDrive
+    eCurrentState : E_AxisState;
+
+    // Active diagnostic error ID reported by the controller
+    udiErrorId    : UDINT;
+END_VAR
+
+VAR_IN_OUT CONSTANT
+    // Read-only reference to the live NC feedback image (position, velocity, status flags)
+    stFeedback    : ST_AxisFeedback;
+END_VAR
+
+VAR_OUTPUT
+    // Consolidated status structure bound to HMI visualization elements and indicators
+    stHmiStatus   : ST_AxisHmiStatus;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ==============================================================================
+// 1. VISUALIZATION STATUS AGGREGATION & MAPPING
+// ==============================================================================
+// Combines low-level NC cyclic telemetry with high-level controller states 
+// and diagnostic fault codes into a single structure for direct VISU/HMI binding.
+
+// Discrete Status Flags
+stHmiStatus.xPowerActive  := stFeedback.xPowerActive;
+stHmiStatus.xReady        := stFeedback.xReady;
+stHmiStatus.xMoving       := stFeedback.xMoving;
+stHmiStatus.xInPosition   := stFeedback.xInPosition;
+stHmiStatus.xError        := (eCurrentState = E_AxisState.ERROR);
+
+// Diagnostic Telemetry & State Machine Tracking
+stHmiStatus.udiErrorId    := udiErrorId;
+stHmiStatus.eCurrentState := eCurrentState;
+stHmiStatus.xInGear 	  := stFeedback.xInGear;
+
+// Live Kinematic Process Data
+stHmiStatus.lrActPos      := stFeedback.lrActPos;
+stHmiStatus.lrActVel      := stFeedback.lrActVel;
+
+
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

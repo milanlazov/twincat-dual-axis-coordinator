@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisHmiCmd" Id="{2e2a827d-60cc-4f65-804f-5cad37fae659}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_AxisHmiCmd
+// Description:    Commissioning & VISU helper structure. Represents virtual command 
+//                 buttons and operator toggles originating from the HMI screen.
+// ==============================================================================
+TYPE ST_AxisHmiCmd :
+STRUCT
+    // --- Drive Power Stage ---
+    xPowerEnable : BOOL; // HMI toggle/button to request drive power enable
+
+    // --- Autonomous Motion Initiation ---
+    xMoveAbs     : BOOL; // HMI button to initiate absolute positioning move
+    xMoveVelo    : BOOL; // HMI button to initiate continuous velocity move
+
+    // --- Manual Continuous Jogging (Maintained) ---
+    xJogBkwFast  : BOOL; // HMI button to manual jog reverse fast (held)
+    xJogBkwSlow  : BOOL; // HMI button to manual jog reverse slow (held)
+    xJogFwdSlow  : BOOL; // HMI button to manual jog forward slow (held)
+    xJogFwdFast  : BOOL; // HMI button to manual jog forward fast (held)
+
+    // --- Stopping, Calibration & Recovery ---
+    xHalt        : BOOL; // HMI button to command controlled deceleration halt
+    xStop        : BOOL; // HMI button to command active stop and axis lock
+    xHome        : BOOL; // HMI button to initiate reference homing sequence
+    xReset       : BOOL; // HMI button to acknowledge and clear active faults
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

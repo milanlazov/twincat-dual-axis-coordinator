@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "definitions": {
+    "UC_AxisFaceplate": {
+      "frameworkControlNamespace": "TcHmi.Controls.Beckhoff",
+      "frameworkControlType": "TcHmi.Controls.System.TcHmiUserControl",
+      "frameworkInstanceOf": "TcHmi.Controls.System.TcHmiControl",
+      "frameworkUserControlConfig": "UserControls\\UC_AxisFaceplate.usercontrol.json",
+      "type": "object",
+      "id": "tchmi:project#/definitions/UC_AxisFaceplate"
+    }
+  }
+}

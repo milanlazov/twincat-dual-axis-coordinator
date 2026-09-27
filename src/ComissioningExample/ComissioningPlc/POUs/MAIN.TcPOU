@@ -1,0 +1,103 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="MAIN" Id="{d20f5cf8-4b41-4a66-9149-2a18f9db0527}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// POU:            MAIN
+// Description:    Top-level application program coordinating ingress signal mapping, 
+//                 dual-drive motion control execution, and HMI telemetry egress.
+// ==============================================================================
+PROGRAM MAIN
+VAR
+    // --- Application Mapping & Execution Instances ---
+    fbMasterAxisInputMapping  : FB_AxisInputMapping;  // Combines HMI and physical panel inputs for Master axis
+    fbSlaveAxisInputMapping   : FB_AxisInputMapping;  // Combines HMI and physical panel inputs for Slave axis
+    
+    fbAxisDualDrive           : FB_AxisDualDrive;     // Core dual-axis equipment module coordinating motion & gearing
+    
+    fbMasterAxisOutputMapping : FB_AxisOutputMapping; // Packs Master telemetry and diagnostics for HMI display
+    fbSlaveAxisOutputMapping  : FB_AxisOutputMapping; // Packs Slave telemetry and diagnostics for HMI display
+
+    // --- Master Axis Local Process Data ---
+    stMasterAxisSystemCmd     : ST_AxisSystemCmd;     // Arbitrated command pipeline dispatched to Master axis
+    stMasterFeedback          : ST_AxisFeedback;      // Live cyclic NC feedback image for Master axis
+    eMasterState              : E_AxisState;          // Active operational state of Master axis controller
+    udiMasterErrorId          : UDINT;                // Active diagnostic error code for Master axis
+
+    // --- Slave Axis Local Process Data ---
+    stSlaveAxisSystemCmd      : ST_AxisSystemCmd;     // Arbitrated command pipeline dispatched to Slave axis
+    stSlaveFeedback           : ST_AxisFeedback;      // Live cyclic NC feedback image for Slave axis
+    eSlaveState               : E_AxisState;          // Active operational state of Slave axis controller
+    udiSlaveErrorId           : UDINT;                // Active diagnostic error code for Slave axis
+END_VAR
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// 1. Ingress Command Mapping: Condition HMI and physical buttons for Master axis
+fbMasterAxisInputMapping(
+    stHmiCmd     := GVL_Motion.Axis_M_Interface.stHmiCmd,
+    stPhysicalIn := GVL_IO.stMaster_Physical_In,
+	
+    stSystemCmd  => stMasterAxisSystemCmd
+);
+
+// 2. Ingress Command Mapping: Condition HMI and physical buttons for Slave axis
+fbSlaveAxisInputMapping(
+    stHmiCmd     := GVL_Motion.Axis_S_Interface.stHmiCmd,
+    stPhysicalIn := GVL_IO.stSlave_Physical_In,
+	
+    stSystemCmd  => stSlaveAxisSystemCmd
+);
+
+// 3. Dual-Drive Coordination: Execute master-slave gearing, power policies, and motion
+fbAxisDualDrive(
+    eCouplingPolicy       := GVL_Motion.DualDrive_Interface.eCouplingPolicy,
+    eDriveType            := GVL_Motion.DualDrive_Interface.eDriveType,
+    lrRatioNumerator      := GVL_Motion.DualDrive_Interface.lrRatioNumerator,
+    iRatioDenominator     := GVL_Motion.DualDrive_Interface.iRatioDenominator,
+    xCmdGearIn            := GVL_Motion.DualDrive_Interface.xCmdGearIn,
+    xCmdGearOut           := GVL_Motion.DualDrive_Interface.xCmdGearOut,
+    xCmdReset             := GVL_Motion.DualDrive_Interface.xCmdReset,
+    xMasterCalibrationCam := GVL_IO.stMaster_Physical_In.xCalibrationCam,
+    xSlaveCalibrationCam  := GVL_IO.stSlave_Physical_In.xCalibrationCam,
+	
+    Axis_Master           := GVL_Motion.Axis_M,
+    Axis_M_Cmd            := stMasterAxisSystemCmd,
+    Axis_M_Config         := GVL_Motion.Axis_M_Interface.stConfig,
+    
+    Axis_Slave            := GVL_Motion.Axis_S,
+    Axis_S_Cmd            := stSlaveAxisSystemCmd,
+    Axis_S_Config         := GVL_Motion.Axis_S_Interface.stConfig,
+    
+    eAxisCouplingState    => GVL_Motion.DualDrive_Interface.eAxisCouplingState,
+	xRegearRequired       => GVL_Motion.DualDrive_Interface.xRegearRequired,
+	lrActiveRatioNum      => GVL_Motion.DualDrive_Interface.lrActiveRatioNum,
+    uiActiveRatioDenom    => GVL_Motion.DualDrive_Interface.uiActiveRatioDenom,
+    xError                => GVL_Motion.DualDrive_Interface.xError,
+    udiErrorId            => GVL_Motion.DualDrive_Interface.udiErrorId,
+    
+    eMasterState          => eMasterState,
+    udiMasterErrorId      => udiMasterErrorId,
+    eSlaveState           => eSlaveState,
+    udiSlaveErrorId       => udiSlaveErrorId,
+    stMasterFeedback      => stMasterFeedback,
+    stSlaveFeedback       => stSlaveFeedback
+);
+
+// 4. Egress Telemetry Mapping: Pack Master states and diagnostics for visualization
+fbMasterAxisOutputMapping(
+    eCurrentState := eMasterState,
+    udiErrorId    := udiMasterErrorId,
+    stFeedback    := stMasterFeedback,
+    stHmiStatus   => GVL_Motion.Axis_M_Interface.stHmiStatus
+);
+
+// 5. Egress Telemetry Mapping: Pack Slave states and diagnostics for visualization
+fbSlaveAxisOutputMapping(
+    eCurrentState := eSlaveState,
+    udiErrorId    := udiSlaveErrorId,
+    stFeedback    := stSlaveFeedback,
+    stHmiStatus   => GVL_Motion.Axis_S_Interface.stHmiStatus
+);]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

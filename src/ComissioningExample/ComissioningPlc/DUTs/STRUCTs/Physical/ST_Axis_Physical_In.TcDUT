@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_Axis_Physical_In" Id="{e8a72745-31dd-4041-ac3a-cabf926162fd}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_Axis_Physical_In
+// Description:    Hardware digital input signals from operator buttons and panel switches.
+// ==============================================================================
+TYPE ST_Axis_Physical_In :
+STRUCT
+    // --- Drive Power Stage ---
+    xPowerEnableBtn   : BOOL; /// Drive power enable button (Normally Open)
+
+    // --- Autonomous Motion Initiation ---
+    xMoveAbsBtn       : BOOL; /// Absolute move start button (Normally Open)
+    xMoveVeloBtn      : BOOL; /// Velocity move start button (Normally Open)
+
+    // --- Manual Continuous Jogging ---
+    xJogBkwFastBtn    : BOOL; /// Fast reverse manual jog button (Normally Open)
+    xJogBkwSlowBtn    : BOOL; /// Slow reverse manual jog button (Normally Open)
+    xJogFwdSlowBtn    : BOOL; /// Slow forward manual jog button (Normally Open)
+    xJogFwdFastBtn    : BOOL; /// Fast forward manual jog button (Normally Open)
+
+    // --- Standstill, Calibration & Diagnostics ---
+    xHaltBtn          : BOOL; /// Controlled deceleration halt button (Normally Open)
+    xStopBtn          : BOOL; /// Hardware stop button (Normally Open)
+    xHomeBtn          : BOOL; /// Reference homing start button (Normally Open)
+	xCalibrationCam   : BOOL; /// Reference homing calibration cam or proximity sensor (Normally Open)
+    xResetBtn         : BOOL; /// Fault reset acknowledgment button (Normally Open)
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

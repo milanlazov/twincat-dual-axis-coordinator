@@ -1,0 +1,60 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_AxisError" Id="{55499afc-4511-4ad2-a2b5-2d679c9350f2}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            E_AxisError
+// Version:        1.0.0.0
+// ==============================================================================
+/// System-wide software diagnostic error codes for axis controllers and dual-drive modules.
+{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE E_AxisError :
+(
+  	/// Axis and equipment module are healthy; no active software faults.
+    NO_ERROR                    := 16#0000,
+
+    // --- Single-Axis Controller Runtime Faults (0x8001 - 0x800F) --- 
+    /// Drive power stage failed to report operational ready within timPowerTimeout
+    ERR_POWER_TIMEOUT           := 16#8001,
+
+    /// MC_Halt deceleration profile was unexpectedly aborted before standstill
+    ERR_HALT_ABORTED            := 16#8002,
+
+    /// MC_Stop deceleration profile was unexpectedly aborted before standstill
+    ERR_STOP_ABORTED            := 16#8003,
+
+    // --- Dual-Axis Coordinator Faults (0x8010 - 0x801F) --- 
+    /// Custom gear ratio denominator cannot be zero
+    ERR_RATIO_DIV_ZERO          := 16#8010,
+
+    /// Custom gear ratio denominator must be a strictly positive integer (> 0)
+    ERR_RATIO_DENOM_NEGATIVE    := 16#8011,
+
+    /// MC_GearIn coupling sequence was aborted prematurely by NC kernel
+    ERR_GEARIN_ABORTED          := 16#8012,
+
+    /// MC_GearOut decoupling sequence was aborted prematurely by NC kernel
+    ERR_GEAROUT_ABORTED         := 16#8013,
+
+    // --- Single-Axis Configuration Faults (0x8020 - 0x802F) ---
+    /// Power-up supervision duration (timPowerTimeout) must be greater than T#0s
+    ERR_CONFIG_POWER_TIMEOUT    := 16#8020,
+
+    /// Active stop deceleration (lrStopDeceleration) must be > 0.0 and lrStopJerk >= 0.0
+    ERR_CONFIG_STOP_DECEL       := 16#8021,
+
+    /// Controlled halt deceleration (lrHaltDeceleration) must be > 0.0 and lrHaltJerk >= 0.0
+    ERR_CONFIG_HALT_DECEL       := 16#8022,
+
+    /// Trajectory limits invalid: lrMaxVelocity, lrMaxAcceleration, or lrMaxDeceleration <= 0.0, or lrMaxJerk < 0.0
+    ERR_CONFIG_MOTION_DYNAMICS  := 16#8023,
+
+    /// Jog limits invalid: selected jog velocity, lrJogAcceleration, or lrJogDeceleration <= 0.0, or lrJogJerk < 0.0
+    ERR_CONFIG_JOG_DYNAMICS     := 16#8024
+) UDINT;
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

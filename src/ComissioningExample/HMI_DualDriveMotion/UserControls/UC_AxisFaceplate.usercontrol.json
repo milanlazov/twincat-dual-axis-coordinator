@@ -1,0 +1,42 @@
+{
+  "parameters": [
+    {
+      "allowSymbolExpressionsInObject": false,
+      "defaultValue": "AXIS",
+      "requiredOnCompile": false,
+      "bindable": true,
+      "propertySetterName": "setAxisTitle",
+      "propertyGetterName": "getAxisTitle",
+      "refTo": "",
+      "name": "data-tchmi-axistitle",
+      "displayName": "AxisTitle",
+      "visible": true,
+      "type": "tchmi:general#/definitions/String",
+      "category": "",
+      "description": "",
+      "readOnly": false,
+      "heritable": true,
+      "propertyName": "AxisTitle"
+    },
+    {
+      "allowSymbolExpressionsInObject": false,
+      "requiredOnCompile": false,
+      "bindable": true,
+      "propertySetterName": "setAxisInterface",
+      "propertyGetterName": "getAxisInterface",
+      "refTo": "",
+      "name": "data-tchmi-axisinterface",
+      "displayName": "AxisInterface",
+      "visible": true,
+      "type": "tchmi:server#/definitions/ADS-PLC1.ST_AxisInterface",
+      "category": "",
+      "description": "",
+      "readOnly": false,
+      "heritable": true,
+      "propertyName": "AxisInterface"
+    }
+  ],
+  "virtualRights": [],
+  "$schema": "./../../Packages/Beckhoff.TwinCAT.HMI.Framework.14.6.3/runtimes/native1.12-tchmi/Schema/UserControlConfig.Schema.json",
+  "description": ""
+}

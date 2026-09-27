@@ -1,0 +1,85 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisConfig" Id="{a7e93021-70a0-4273-b597-b4ac332dcce3}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            ST_AxisConfig
+// Version:        1.0.0.0
+// ==============================================================================
+/// Kinematic profile limits, jog parameters, stopping dynamics, and timeouts for an axis.
+TYPE ST_AxisConfig :
+STRUCT
+    // --- Profile Kinematic Limits --- 
+    /// Operational velocity setpoint (> 0.0 required)
+    lrMaxVelocity        : LREAL;
+
+    /// Acceleration rate (> 0.0 required)
+    lrMaxAcceleration    : LREAL;
+
+    /// Deceleration rate (> 0.0 required)
+    lrMaxDeceleration    : LREAL;
+
+    /// Jerk rate for S-curve smoothing (>= 0.0, 0 = trapezoidal)
+    lrMaxJerk            : LREAL;
+
+    // --- Manual Jog Dynamics --- 
+    /// Fast manual jog velocity in reverse direction (> 0.0 required)
+    lrJogBkwFastVelocity : LREAL;
+
+    /// Slow manual jog velocity in reverse direction (> 0.0 required)
+    lrJogBkwSlowVelocity : LREAL;
+
+    /// Slow manual jog velocity in forward direction (> 0.0 required)
+    lrJogFwdSlowVelocity : LREAL;
+
+    /// Fast manual jog velocity in forward direction (> 0.0 required)
+    lrJogFwdFastVelocity : LREAL;
+
+    /// Acceleration rate during manual jogging (> 0.0 required)
+    lrJogAcceleration    : LREAL;
+
+    /// Deceleration rate during manual jogging (> 0.0 required)
+    lrJogDeceleration    : LREAL;
+
+    /// Jerk rate during manual jogging (>= 0.0, 0 = trapezoidal)
+    lrJogJerk            : LREAL;
+
+    // --- Stopping Dynamics (MC_Stop) --- 
+    /// Active stop deceleration rate (> 0.0 required)
+    lrStopDeceleration   : LREAL;
+
+    /// Active stop jerk rate (>= 0.0, 0 = trapezoidal)
+    lrStopJerk           : LREAL;
+
+    // --- Halting Dynamics (MC_Halt) --- 
+    /// Controlled halt deceleration rate (> 0.0 required)
+    lrHaltDeceleration   : LREAL;
+
+    /// Controlled halt jerk rate (>= 0.0, 0 = trapezoidal)
+    lrHaltJerk           : LREAL;
+
+    // --- Target Trajectory & Direction --- 
+    /// Target destination coordinate for absolute moves
+    lrTargetPosition     : LREAL;
+
+    /// Travel direction for continuous velocity moves
+    eActiveDirection     : MC_Direction;
+
+    // --- Homing Calibration --- 
+    /// Reference coordinate assigned upon homing completion
+    lrHomePosition       : LREAL;
+
+    /// Homing routine mode for NC referencing
+    eHomingMode          : MC_HomingMode;
+
+    // --- Supervisory Timeouts --- 
+    /// Maximum allowable duration to confirm drive power enable [seconds] (> 0.0s required)
+    lrPowerTimeout       : LREAL := 5.0;
+
+    /// Standstill jitter filter duration before flagging external motion [milliseconds] (> 0.0ms required)
+    lrJitterTolerance    : LREAL := 100.0;
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

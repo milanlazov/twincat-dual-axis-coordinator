@@ -1,0 +1,53 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="fValidateAxisConfig" Id="{feb56dbc-716e-4ca5-9c82-16850a3b1b7f}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// POU:            fValidateAxisConfig
+// Version:        1.0.0.0
+// ==============================================================================
+/// Evaluates physical, dynamic, and framework invariants of an axis configuration structure.
+/// Returns 0 if all parameters are valid, or the specific diagnostic ID from E_AxisError if an invariant fails.
+FUNCTION INTERNAL fValidateAxisConfig : UDINT
+VAR_IN_OUT CONSTANT
+    /// Read-only reference to the axis configuration structure (ST_AxisConfig) being validated.
+    stConfig : ST_AxisConfig;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// 1. Framework Supervision Timeout
+IF (stConfig.lrPowerTimeout <= 0) THEN
+    fValidateAxisConfig := TO_UDINT(E_AxisError.ERR_CONFIG_POWER_TIMEOUT);
+
+// 2. Active Stop Braking Dynamics (MC_Stop)
+ELSIF (stConfig.lrStopDeceleration <= 0.0) OR (stConfig.lrStopJerk < 0.0) THEN
+    fValidateAxisConfig := TO_UDINT(E_AxisError.ERR_CONFIG_STOP_DECEL);
+
+// 3. Controlled Halt Braking Dynamics (MC_Halt)
+ELSIF (stConfig.lrHaltDeceleration <= 0.0) OR (stConfig.lrHaltJerk < 0.0) THEN
+    fValidateAxisConfig := TO_UDINT(E_AxisError.ERR_CONFIG_HALT_DECEL);
+
+// 4. Automatic Trajectory Limits (MC_MoveAbsolute & MC_MoveVelocity)
+ELSIF (stConfig.lrMaxVelocity <= 0.0) 
+   OR (stConfig.lrMaxAcceleration <= 0.0) 
+   OR (stConfig.lrMaxDeceleration <= 0.0) 
+   OR (stConfig.lrMaxJerk < 0.0) THEN
+    fValidateAxisConfig := TO_UDINT(E_AxisError.ERR_CONFIG_MOTION_DYNAMICS);
+
+// 5. Manual Jogging Dynamics & Speeds (MC_Jog)
+ELSIF (stConfig.lrJogAcceleration <= 0.0) 
+   OR (stConfig.lrJogDeceleration <= 0.0) 
+   OR (stConfig.lrJogJerk < 0.0)
+   OR (stConfig.lrJogBkwFastVelocity <= 0.0)
+   OR (stConfig.lrJogBkwSlowVelocity <= 0.0)
+   OR (stConfig.lrJogFwdSlowVelocity <= 0.0)
+   OR (stConfig.lrJogFwdFastVelocity <= 0.0) THEN
+    fValidateAxisConfig := TO_UDINT(E_AxisError.ERR_CONFIG_JOG_DYNAMICS);
+
+// All invariants mathematically and physically verified
+ELSE
+    fValidateAxisConfig := 0;
+END_IF]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

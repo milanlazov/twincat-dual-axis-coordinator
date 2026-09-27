@@ -1,0 +1,33 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_DualDriveInterface" Id="{a7152faa-11bc-4ecf-82a3-9aa10fadda5d}">
+    <Declaration><![CDATA[// ==============================================================================
+// DUT:            ST_DualDriveInterface
+// Description:    Commissioning & VISU composite interface structure. Combines 
+//                 dual-drive supervisory commands, pairing configurations, 
+//                 and system-wide telemetry into a single visualization node.
+// ==============================================================================
+TYPE ST_DualDriveInterface :
+STRUCT
+    // --- Supervisory Coordination Commands ---
+    xCmdGearIn         : BOOL; // HMI button to trigger master-slave synchronization
+    xCmdGearOut        : BOOL; // HMI button to trigger electronic decoupling
+    xCmdReset          : BOOL; // HMI button to clear coordinator and child axis faults
+
+    // --- Pairing Configuration & Topology ---
+    eCouplingPolicy    : E_DualDriveCouplingPolicy := E_DualDriveCouplingPolicy.PERSISTENT_TANDEM; // Active tandem power and cross-stopping policy
+    eDriveType         : E_DualDriveType           := E_DualDriveType.CUSTOM;                      // Mechanical pairing topology preset
+    lrRatioNumerator   : LREAL                     := 1.0;                                         // Electronic gear ratio numerator multiplier
+    iRatioDenominator  : INT                       := 1;                                           // Electronic gear ratio positive denominator
+
+    // --- Supervisory Telemetry & Diagnostics ---
+    eAxisCouplingState : E_AxisCouplingState; // Active electronic gearing lifecycle state
+	xRegearRequired    : BOOL;                // Asserted TRUE when configured ratio inputs differ from active locked ratio
+    lrActiveRatioNum   : LREAL; 			  // Active electronic gear ratio numerator currently locked in the NC kernel setpoint generator.
+    uiActiveRatioDenom : UINT; 				  // Active electronic gear ratio denominator currently locked in the NC kernel setpoint generator.
+    xError             : BOOL;                // Composite fault indicator for the dual-drive module
+    udiErrorId         : UDINT;               // Prioritized diagnostic error code (0 if healthy)
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

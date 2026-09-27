@@ -1,0 +1,984 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_AxisDualDrive" Id="{e934087b-5c0c-4e48-ba93-7517aaf39af5}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           16.09.2026
+// POU:            FB_AxisDualDrive
+// Version:        1.0.0.0
+// ==============================================================================
+/// Dual-axis equipment module coordinating electronic gearing lifecycles, tandem power policies, and motion execution for paired master and slave axes.
+// Functional Architecture and Subsystem Responsibilities:
+// - Encapsulated Motion Execution: Instantiates and supervises two independent single-axis controllers, arbitrating effective commands while preserving caller immutability.
+// - Electronic Gearing Lifecycle: Manages the complete coupling and decoupling state progression (UNSYNCED, GEARING_IN, GEARING_OUT, SYNCED) via encapsulated PLCopen gearing blocks.
+// - Kinematic Pairing Topologies: Supports fixed Bi-Parting (-1:1), Telescopic (+2:1), and user-defined Custom electronic gear ratios with integrated divide-by-zero validation.
+// - Coupling and Safety Policies: Governs operational behavior across power cycles, power-down decoupling, cross-axis stopping, and tandem power synchronization via E_DualDriveCouplingPolicy.
+// - Cross-Axis Protection and Stopping: Interlocks motion during transitions and commands controlled deceleration stops across paired axes upon partner faults or uncoupling events.
+// - Unified Reset Coordination: Acknowledges coordinator-level synchronization and gearing faults while actively dispatching reset pulses to whichever child axes are faulted, confirming complete multi-domain recovery before restoring operational standby.
+{attribute 'hide_all_locals'}
+FUNCTION_BLOCK FB_AxisDualDrive
+VAR_INPUT
+    // --- Operational Coupling Policy and Topology Configuration ---
+
+    /// Operational policy governing tandem power arbitration, power-down decoupling, and cross-axis stopping.
+    /// - PERSISTENT_TANDEM: Retains electronic coupling across software power cycles, enforces synchronized dual-permissive power when coupled, and stops the master if the slave decouples.
+    /// - MODULAR_TANDEM_STOP: Automatically decouples axes via MC_GearOut on software power disable, permits independent uncoupled power, and stops the master if the slave decouples.
+    /// - MODULAR_INDEPENDENT: Automatically decouples axes via MC_GearOut on software power disable, permits independent uncoupled power, and allows the master to continue trajectory autonomously if the slave decouples.
+    /// - Default is PERSISTENT_TANDEM.
+    eCouplingPolicy        : E_DualDriveCouplingPolicy;
+
+    /// Mechanical pairing topology defining the operational gear ratio relationship.
+    /// - BI_PARTING: Inverted ratio of -1.0 for opposing travel.
+    /// - TELESCOPIC: Ratio of 2.0 for differential-speed parallel travel.
+    /// - CUSTOM: Resolves ratio dynamically via lrRatioNumerator and iRatioDenominator.
+    /// - Note: Changing topology while coupled (SYNCED) sets xRegearRequired = TRUE. 
+    ///   Pulse xCmdGearIn at standstill to apply the update.
+    eDriveType             : E_DualDriveType;
+
+    /// Numerator value for custom electronic gear ratio calculation.
+    /// - Evaluated exclusively when eDriveType is configured to CUSTOM.
+    /// - Represents the gear ratio numerator as a floating-point multiplier (LREAL).
+    /// - Default is -1.0.
+    lrRatioNumerator       : LREAL := -1.0;
+
+    /// Denominator value for custom electronic gear ratio calculation.
+    /// - Evaluated exclusively when eDriveType is configured to CUSTOM.
+    /// - Must be configured as a strictly positive integer (> 0); values <= 0 trigger internal diagnostic faults and inhibit gearing.
+    /// - Converted internally to an unsigned integer (UINT) for NC kernel processing.
+    /// - Default is 1.
+    iRatioDenominator      : INT   := 1;
+
+    // --- Supervisory Coordination Commands ---
+
+    /// Command input requesting electronic synchronization of the slave axis to the master axis.
+    /// - Evaluated strictly on a rising edge (FALSE-to-TRUE transition).
+    /// - Rising-Edge Precondition Trap: Gating requires both axes to be stationary in IDLE. If held TRUE continuously while axes are busy, the rising edge is consumed and rejected; dropping and re-asserting the signal (a fresh rising edge) is required once both axes reach IDLE.
+    /// - Dynamic Re-Gearing: Pulsing while already coupled at standstill automatically triggers an uncouple-recouple sequence to apply updated ratio parameters.
+    xCmdGearIn             : BOOL;
+
+    /// Command input requesting controlled electronic decoupling of the slave axis from the master axis.
+    /// - Evaluated strictly on a rising edge (FALSE-to-TRUE transition).
+    /// - Initiates MC_GearOut to dissolve the electronic setpoint link in the NC kernel.
+    /// - Rising-Edge Precondition Trap: Holding this signal TRUE continuously will not repeatedly trigger uncoupling; an explicit fresh rising edge is required.
+    /// - Upon successful decoupling, commands an active deceleration stop on the slave (and master, if configured by policy) if motion was active.
+    xCmdGearOut            : BOOL;
+
+    /// Command input requesting acknowledgment and recovery from dual-drive and child axis fault conditions.
+    /// - Evaluated strictly on a rising edge (FALSE-to-TRUE transition).
+    /// - Dual-Action Reset: Clears coordinator-level gearing and configuration faults while simultaneously forwarding reset commands to whichever child axes are in ERROR.
+    /// - Rising-Edge Precondition Trap: If held TRUE continuously while an underlying physical fault remains present, clearing will fail and will not re-attempt once the fault clears; a fresh rising edge is required.
+    xCmdReset              : BOOL;
+	
+	// --- Hardware Field Sensors & Referencing ---
+
+    /// Reference homing calibration cam switch signal for master axis referencing.
+    /// Passed directly to the encapsulated master controller (fbMaster.xCalibrationCam).
+    xMasterCalibrationCam  : BOOL;
+
+    /// Reference homing calibration cam switch signal for slave axis referencing.
+    /// Passed directly to the encapsulated slave controller (fbSlave.xCalibrationCam).
+    xSlaveCalibrationCam   : BOOL;
+END_VAR
+
+VAR_IN_OUT CONSTANT
+    // --- Ingress Command Pipelines and Kinematic Configurations (Read-Only) ---
+
+    /// Read-only reference to the incoming master axis command structure.
+    /// - Expects ST_AxisSystemCmd containing operational command signals for the master axis.
+    /// - Defensive Working Copy: The coordinator copies this structure into an internal working buffer, allowing it to inject cross-stops, motion interlocks, and power overrides to the child controller without overwriting the caller's original command variables.
+    Axis_M_Cmd             : ST_AxisSystemCmd;
+
+    /// Read-only reference to the incoming slave axis command structure.
+    /// - Expects ST_AxisSystemCmd containing operational command signals for the slave axis.
+    /// - Defensive Working Copy: The coordinator copies this structure into an internal working buffer, allowing it to inject cross-stops, motion interlocks, and power overrides to the child controller without overwriting the caller's original command variables.
+    Axis_S_Cmd             : ST_AxisSystemCmd;
+
+    /// Read-only reference to the master axis configuration and kinematic limits structure.
+    /// - Expects ST_AxisConfig containing master profile limits: velocities, accelerations, decelerations, jerks, and timeouts.
+    Axis_M_Config          : ST_AxisConfig;
+
+    /// Read-only reference to the slave axis configuration and kinematic limits structure.
+    /// - Expects ST_AxisConfig containing slave profile limits: velocities, accelerations, decelerations, jerks, and timeouts.
+    /// - Kinematic limits (acceleration, deceleration, jerk) are supplied directly to MC_GearIn during synchronization.
+    Axis_S_Config          : ST_AxisConfig;
+END_VAR
+
+VAR_IN_OUT
+    // --- TwinCAT NC Hardware Interfaces ---
+
+    /// Bidirectional hardware interface linking the PLC to the master TwinCAT NC axis.
+    /// - Must be bound to an AXIS_REF instance linked to the master NC axis in the TwinCAT motion task.
+    Axis_Master            : AXIS_REF;
+
+    /// Bidirectional hardware interface linking the PLC to the slave TwinCAT NC axis.
+    /// - Must be bound to an AXIS_REF instance linked to the slave NC axis in the TwinCAT motion task.
+    Axis_Slave             : AXIS_REF;
+END_VAR
+
+VAR_OUTPUT
+    // --- Dual-Drive Operational Telemetry and Diagnostics ---
+
+    /// Active operational coupling state of the master-slave dual-drive coordination system.
+    /// - Outputs E_AxisCouplingState (UNSYNCED, GEARING_IN, GEARING_OUT, SYNCED, ERROR).
+    eAxisCouplingState     : E_AxisCouplingState;
+	
+	/// Asserted TRUE when configured gear ratio inputs differ from the active ratio locked in the NC kernel.
+    /// Informs supervisory logic and HMIs that a new ratio is pending and xCmdGearIn must be pulsed at standstill.
+    xRegearRequired : BOOL;
+	
+	/// Active electronic gear ratio numerator currently locked in the NC kernel setpoint generator.
+    lrActiveRatioNum       : LREAL;
+
+    /// Active electronic gear ratio denominator currently locked in the NC kernel setpoint generator.
+    uiActiveRatioDenom     : UINT;
+	
+    /// Composite fault flag asserted TRUE when the equipment module or either child axis is in a fault state.
+    /// - Evaluates TRUE if and only if eAxisCouplingState = E_AxisCouplingState.ERROR.
+    /// - Indicates an active gearing block fault, invalid ratio configuration, or child axis controller trip.
+    xError                 : BOOL;
+
+    /// Active diagnostic error ID prioritized across the entire dual-drive system.
+    /// - 16#4000..16#4FFF: TwinCAT NC kernel or drive amplifier hardware trip (refer to Beckhoff Infosys).
+    /// - 16#8000..16#8FFF: Motion library software fault (refer to E_AxisError).
+    /// - 0: System is healthy (clears once all subsystems confirm verified recovery)
+	// Arbitrated in Stage 8 via strict priority cascade:
+    // Gearing/Ratio faults (udiCouplingErrorId) > Master axis faults (_udiMasterErrorId) > Slave axis faults (_udiSlaveErrorId).
+    udiErrorId             : UDINT;
+
+    // --- Child Controller Telemetry Egress ---
+
+    /// Active operational state of the encapsulated master axis controller.
+    /// - Outputs E_AxisState reflecting the live state of the master controller (e.g., IDLE, MOVEABS, MOVEVELO, ERROR).
+    eMasterState           : E_AxisState;
+
+    /// Distinct diagnostic error code originating from the master axis controller or drive stage.
+    /// - Reports the NC kernel error ID, drive hardware fault, or software timeout for the master axis; returns 0 if healthy.
+    udiMasterErrorId       : UDINT;
+
+    /// Active operational state of the encapsulated slave axis controller.
+    /// - Outputs E_AxisState reflecting the live state of the slave controller (e.g., IDLE, GEARED, STOPPING, ERROR).
+    eSlaveState            : E_AxisState;
+
+    /// Distinct diagnostic error code originating from the slave axis controller or drive stage.
+    /// - Reports the NC kernel error ID, drive hardware fault, or software timeout for the slave axis; returns 0 if healthy.
+    udiSlaveErrorId        : UDINT;
+	
+	/// Cyclic feedback process image for master axis reflecting actual NC axis status and kinematics.
+    /// Outputs ST_AxisFeedback containing live motion telemetry: actual position, actual velocity, 
+    /// power status, operational ready flag, standstill/moving status, homing calibration status, 
+    /// in-position flag, NC coupling flag (xInGear), error status, and active NC error ID.
+	stMasterFeedback         : ST_AxisFeedback; 
+    
+	/// Cyclic feedback process image for slave axis reflecting actual NC axis status and kinematics.
+    /// Outputs ST_AxisFeedback containing live motion telemetry: actual position, actual velocity, 
+    /// power status, operational ready flag, standstill/moving status, homing calibration status, 
+    /// in-position flag, NC coupling flag (xInGear), error status, and active NC error ID.
+    stSlaveFeedback          : ST_AxisFeedback;        
+END_VAR
+
+VAR
+    // --- Backing Registers (Cycle-Boundary Output Mapping) ---
+    // Private registers updated dynamically during execution and copied atomically to 
+    // public VAR_OUTPUT pins at the cycle boundary to prevent exposing partial state updates.
+    _eAxisCouplingState     : E_AxisCouplingState; // Internal coordinator state machine register mapped to eAxisCouplingState
+	_xRegearRequired        : BOOL;                   // Backing register for cycle-boundary xRegearRequired mapping
+    _xError                 : BOOL;                // Latched fault flag asserted when _eAxisCouplingState = E_AxisCouplingState.ERROR
+    _udiErrorId             : UDINT;               // System-wide prioritized diagnostic fault ID mapped to udiErrorId
+    _eMasterState           : E_AxisState;         // Cached operational state received from fbMaster
+    _udiMasterErrorId       : UDINT;               // Cached diagnostic error code received from fbMaster
+    _eSlaveState            : E_AxisState;         // Cached operational state received from fbSlave
+    _udiSlaveErrorId        : UDINT;               // Cached diagnostic error code received from fbSlave
+
+    // --- Encapsulated Motion Controllers ---
+    // Autonomous single-axis controllers managing drive power stages, homing routines, 
+    // motion profiles, manual jogging, and hardware trips for each individual axis.
+    fbMaster                : FB_AxisController;   // Core state-machine controller for the master axis
+    fbSlave                 : FB_AxisController;   // Core state-machine controller for the slave axis
+
+    // --- Cyclic NC Feedback Ingress & Process Data ---
+    // Ingress mapping instances execute at the top of the routine to translate raw NC cyclic 
+    // communication registers (Axis.Status, Axis.NcToPlc) into typed feedback structures.
+    // Evaluating feedback directly provides cycle-1 fault detection before child controllers execute.
+    fbMasterFeedbackMapping : FB_AxisFeedbackMapping; // Cyclic feedback parser for master NC axis interface
+    fbSlaveFeedbackMapping  : FB_AxisFeedbackMapping; // Cyclic feedback parser for slave NC axis interface
+
+    // --- Effective Command Buffers (Defensive Copy Pattern) ---
+    // Local working buffers populated from caller references (Axis_M_Cmd, Axis_S_Cmd).
+    // Provides the coordinator full authority to inject cross-stops, motion interlocks, 
+    // and tandem power synchronization before passing commands to child controllers, 
+    // strictly preserving caller memory immutability.
+    stMasterEffectiveCmd    : ST_AxisSystemCmd;       // Arbitrated command pipeline dispatched to fbMaster
+    stSlaveEffectiveCmd     : ST_AxisSystemCmd;       // Arbitrated command pipeline dispatched to fbSlave
+
+    // --- PLCopen Electronic Gearing Function Blocks ---
+    // Low-level NC setpoint coordination blocks executed unconditionally outside the state machine.
+    fbGearIn                : MC_GearIn;              // Links slave setpoint table to master setpoint table at configured gear ratio
+    fbGearOut               : MC_GearOut;             // Dissolves setpoint linkage in NC kernel (slave continues at current velocity until stopped)
+
+    // --- Command Edge Detection (Anti-Latching & Timing Hazard Guards) ---
+    // Converts sustained or pulsed supervisory command signals into clean single-scan pulses.
+    // Guards against command looping, HMI toggle latching, and asynchronous task race conditions.
+    fbPulsedCmdGearIn       : R_TRIG;                 // Edge detector for deliberate gear-in and dynamic re-gearing requests
+    fbPulsedCmdGearOut      : R_TRIG;                 // Edge detector for electronic decoupling requests
+    fbPulsedCmdReset        : R_TRIG;                 // Edge detector for supervisory fault reset requests
+
+    // --- Gearing Diagnostics & Dynamic Kinematic Arbitration ---
+    udiCouplingErrorId      : UDINT;                  // Dedicated diagnostic register tracking fbGearIn, fbGearOut, and configuration faults
+    xRatioConfigValid       : BOOL;                   // Flag asserted TRUE when denominator validation checks confirm > 0
+    xRegearPending          : BOOL;                   // Sequence flag indicating an automated decouple-recouple ratio change is active
+    lrResolvedRatioNum      : LREAL;                  // Dynamically resolved numerator applied to fbGearIn.RatioNumerator
+    uiResolvedRatioDenom    : UINT := 1;              // Dynamically resolved positive denominator applied to fbGearIn.RatioDenominator
+    xMotionInterlock        : BOOL;                   // Interlock dispatched to child controllers to block motion during gearing or fault states
+    xSlaveAllowJog          : BOOL := TRUE;           // Dynamic permissive gating manual jogging on slave axis (revoked when coupled)
+
+    // --- Decoded Coupling Policy Behavioral Flags ---
+    // Internal behavioral flags extracted cyclically from eCouplingPolicy.
+    xDecoupleOnDisable      : BOOL;                   // Initiates MC_GearOut when software power is dropped while coupled
+    xStopMasterOnDecouple   : BOOL;                   // Enforces tandem cross-stopping on master if slave decouples, trips, or halts
+    xUnifiedPower           : BOOL;                   // Enforces dual-permissive power arbitration (both stations must enable to power drives)
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[ // ==============================================================================
+// 1. CYCLIC NC FEEDBACK INGRESS & COMMAND DEFENSIVE COPYING
+// ==============================================================================
+// Ingress mapping blocks execute first to extract live cyclic NC process data 
+// (Axis.Status, Axis.NcToPlc) into standardized local feedback images. 
+// Executing mapping at the top guarantees that kernel-level error trips, moving 
+// status, and NC coupling states (xInGear) evaluate on Cycle 1 before any 
+// coordinator state logic or command arbitration executes.
+fbMasterFeedbackMapping(
+    Axis       := Axis_Master,
+    stFeedback => stMasterFeedback
+);
+
+fbSlaveFeedbackMapping(
+    Axis       := Axis_Slave,
+    stFeedback => stSlaveFeedback
+);
+
+// --- Ingress Command Ingestion (Defensive Copy Pattern) ---
+// Takes private working copies of external commands (Axis_M_Cmd, Axis_S_Cmd).
+// In IEC 61131-3, VAR_IN_OUT CONSTANT enforces read-only immutability on caller 
+// memory. Creating local working buffers grants the coordinator full authority 
+// to inject emergency stops, motion interlocks, and tandem power synchronization 
+// before passing commands to child controllers, without mutating the caller's 
+// original variables in MAIN or on the HMI.
+stMasterEffectiveCmd := Axis_M_Cmd;
+stSlaveEffectiveCmd  := Axis_S_Cmd;
+
+// ==============================================================================
+// 2. POLICY EXTRACTION & KINEMATIC TOPOLOGY DECODING
+// ==============================================================================
+
+// --- Operational Coupling Policy Decoding ---
+// Deconstructs the high-level policy enum into discrete operational flags that 
+// govern power-down decoupling, cross-axis stopping, and power synchronization.
+CASE eCouplingPolicy OF
+    E_DualDriveCouplingPolicy.PERSISTENT_TANDEM:
+        // Rigid Mechanical Coupling / Gantry Topology:
+        // Axes remain coupled across power cycles and software disable.
+        // Enforces tandem cross-stopping (Master halts if Slave uncouples or trips).
+        // Enforces dual-permissive power arbitration while coupled.
+        xDecoupleOnDisable    := FALSE;
+        xStopMasterOnDecouple := TRUE;
+        xUnifiedPower         := TRUE;
+
+    E_DualDriveCouplingPolicy.MODULAR_TANDEM_STOP:
+        // Dynamic / On-Demand Coupling with Collective Mechanical Safety:
+        // Automatically dissolves coupling via MC_GearOut on software disable.
+        // Enforces tandem cross-stopping (Master halts if Slave uncouples or trips).
+        // Permits independent axis power when uncoupled.
+        xDecoupleOnDisable    := TRUE;
+        xStopMasterOnDecouple := TRUE;
+        xUnifiedPower         := FALSE;
+
+    E_DualDriveCouplingPolicy.MODULAR_INDEPENDENT:
+        // Dynamic / On-Demand Coupling with Master Trajectory Autonomy:
+        // Automatically dissolves coupling via MC_GearOut on software disable.
+        // Master is permitted to continue motion autonomously if Slave uncouples.
+        // Permits independent axis power when uncoupled.
+        xDecoupleOnDisable    := TRUE;
+        xStopMasterOnDecouple := FALSE;
+        xUnifiedPower         := FALSE;
+END_CASE
+
+// --- Tandem Command Shadowing & Power Arbitration (PERSISTENT_TANDEM) ---
+// In TwinCAT NC, commanding MC_Stop to a moving slave dissolves the electronic gear.
+// To preserve PERSISTENT_TANDEM coupling during a stop or power-down event, the 
+// coordinator must proxy all deceleration authority to the Master axis and shield 
+// the Slave from executing MC_Stop locally.
+IF xUnifiedPower AND stSlaveFeedback.xInGear THEN
+    
+    // 1. Cross-Route Slave Stops & Halts to the Master
+    // If the operator presses Stop/Halt on the Slave panel, the Master executes 
+    // the deceleration ramp, keeping the gantry perfectly squared.
+    stMasterEffectiveCmd.xStop := Axis_M_Cmd.xStop OR Axis_S_Cmd.xStop;
+    stMasterEffectiveCmd.xHalt := Axis_M_Cmd.xHalt OR Axis_S_Cmd.xHalt;
+    
+    // Hide Stop/Halt from the slave so it doesn't trigger MC_Stop locally
+    stSlaveEffectiveCmd.xStop  := FALSE;
+    stSlaveEffectiveCmd.xHalt  := FALSE;
+    
+    // 2. Tandem Power-Down Sequencing (The Standstill Shadowing Trick)
+    // If either station revokes power, we drop the Master immediately so it ramps down.
+    stMasterEffectiveCmd.xPowerEnable := Axis_M_Cmd.xPowerEnable AND Axis_S_Cmd.xPowerEnable;
+    
+    // We HOLD the slave's effective power TRUE until physical standstill is achieved.
+    IF NOT stMasterEffectiveCmd.xPowerEnable AND (stMasterFeedback.xMoving OR stSlaveFeedback.xMoving) THEN
+        stSlaveEffectiveCmd.xPowerEnable := TRUE; 
+    ELSE
+        // Once at 0.0 mm/s, we finally drop the slave's power.
+        // Because the slave is not moving, FB_AxisController bypasses STOPPING and 
+        // goes directly to OFF. Drive de-energizes, but the NC gear remains perfectly intact!
+        stSlaveEffectiveCmd.xPowerEnable := stMasterEffectiveCmd.xPowerEnable;
+    END_IF
+    
+END_IF
+
+// --- Electronic Gear Ratio & Kinematic Topology Resolution ---
+// Resolves the electronic gear numerator and denominator based on mechanical pairing.
+// Validates user configuration dynamically to prevent NC kernel mathematical faults.
+CASE eDriveType OF
+    
+    E_DualDriveType.BI_PARTING:
+        // Opposing Directional Travel (e.g., center-opening doors, symmetric clamps):
+        // Slave moves in equal and opposite direction relative to Master (Ratio = -1.0 / 1).
+        lrResolvedRatioNum   := -1.0;
+        uiResolvedRatioDenom := 1;
+        xRatioConfigValid    := TRUE;
+
+    E_DualDriveType.TELESCOPIC:
+        // Differential Speed Travel (e.g., multi-stage telescopic slides):
+        // Slave travels in the same direction at twice the speed of Master (Ratio = 2.0 / 1).
+        lrResolvedRatioNum   := 2.0;
+        uiResolvedRatioDenom := 1;
+        xRatioConfigValid    := TRUE;
+        
+    E_DualDriveType.CUSTOM:
+        // User-Defined Electronic Gear Ratio:
+        // HMI Compatibility & Defensive Ingress Arbitration:
+        // Standard HMI numeric input fields and operator entry screens typically bound to 
+        // signed integers (INT). To eliminate the need for upstream type conversions in the 
+        // visualization layer, the interface accepts an INT and handles validation and casting 
+        // internally before passing to the NC setpoint generator.
+        //
+        // Runtime Bounds & Sign Validation:
+        // TwinCAT NC (MC_GearIn.RatioDenominator) strictly requires an unsigned positive 
+        // integer (UINT > 0). Denominators <= 0 are trapped here to prevent floating-point 
+        // divide-by-zero or kernel-level calculation faults.
+        IF iRatioDenominator = 0 THEN
+            udiCouplingErrorId  := TO_UDINT(E_AxisError.ERR_RATIO_DIV_ZERO);
+            _eAxisCouplingState := E_AxisCouplingState.ERROR;
+            xRatioConfigValid   := FALSE;
+            
+        ELSIF iRatioDenominator < 0 THEN
+            udiCouplingErrorId  := TO_UDINT(E_AxisError.ERR_RATIO_DENOM_NEGATIVE);
+            _eAxisCouplingState := E_AxisCouplingState.ERROR;
+            xRatioConfigValid   := FALSE;
+            
+        ELSE
+            // Valid positive integer -> Safe conversion to NC-compliant unsigned type
+            lrResolvedRatioNum   := lrRatioNumerator;
+            uiResolvedRatioDenom := INT_TO_UINT(iRatioDenominator);
+            xRatioConfigValid    := TRUE;
+        END_IF
+        
+END_CASE
+
+// ==============================================================================
+// 3. GLOBAL COUPLING ERROR EVALUATION & CYCLE-1 FAULT SENSING
+// ==============================================================================
+// Evaluates error outputs from the underlying gearing function blocks (MC_GearIn 
+// and MC_GearOut), cached states of child axis controllers, and live NC process images.
+// If any gearing block reports a fault, or if either axis controller or drive trips, 
+// the coordinator immediately overrides the current operational state and transitions 
+// into ERROR to initiate controlled cross-fault shutdown.
+//
+// Dual-Layer Diagnostic Sensing & Cycle-1 Fault Responsiveness:
+// 1. Gearing Block Layer (fbGearIn.Error, fbGearOut.Error):
+//    Latches gearing-specific fault codes into udiCouplingErrorId. This variable 
+//    strictly tracks gearing/ratio faults, remaining 0 if the fault originated on a 
+//    child axis. This guarantees unambiguous fault telemetry during the Stage 5 cascade.
+// 2. Child State Machine Layer (_eMasterState, _eSlaveState):
+//    Evaluates whether either child controller is currently resting in E_AxisState.ERROR 
+//    (e.g., due to software power timeouts, stop/halt aborts, or homing failures).
+// 3. Direct Cyclic Hardware Layer (stMasterFeedback.xError, stSlaveFeedback.xError):
+//    Because child controllers (fbMaster, fbSlave) execute at the bottom of the routine 
+//    (Stage 4), their state outputs lag by one scan cycle. Evaluating the cyclic process 
+//    image directly (populated at Stage 1) allows the coordinator to catch physical drive 
+//    trips, STO drops, and NC kernel errors on Cycle 1, eliminating a one-cycle latency hazard.
+IF fbGearIn.Error THEN
+    udiCouplingErrorId  := fbGearIn.ErrorID;
+    _eAxisCouplingState := E_AxisCouplingState.ERROR;
+    
+ELSIF fbGearOut.Error THEN
+    udiCouplingErrorId  := fbGearOut.ErrorID;
+    _eAxisCouplingState := E_AxisCouplingState.ERROR;
+    
+ELSIF (_eMasterState = E_AxisState.ERROR) OR (_eSlaveState = E_AxisState.ERROR) THEN
+    _eAxisCouplingState := E_AxisCouplingState.ERROR;
+    
+ELSIF stMasterFeedback.xError OR stSlaveFeedback.xError THEN
+    _eAxisCouplingState := E_AxisCouplingState.ERROR;
+END_IF
+
+// ==============================================================================
+// 4. COMMAND EDGE DETECTION (CYCLIC UPDATE)
+// ==============================================================================
+// Converts incoming supervisory signals into clean, single-scan execution pulses.
+// Executing edge blocks unconditionally before the coordinator state machine ensures:
+// 1. Immediate Pulse Generation: Fresh rising edges are detected on the exact scan 
+//    they occur and are available for state transitions in the subsequent CASE statement.
+// 2. Anti-Latching Protection: Internal CLK states update cyclically, guaranteeing that 
+//    maintained inputs cannot generate repeated execution triggers across multiple scans.
+fbPulsedCmdGearIn (CLK := xCmdGearIn);
+fbPulsedCmdGearOut(CLK := xCmdGearOut);
+fbPulsedCmdReset  (CLK := xCmdReset);
+
+// ==============================================================================
+// 5. COORDINATOR (SYNCING) STATE MACHINE
+// ==============================================================================
+// Governs the high-level electronic gearing lifecycle between Master and Slave.
+// Arbitrates synchronization, controlled decoupling, re-gearing sequences, 
+// and cross-axis stopping rules without directly mutating caller command memory.
+CASE _eAxisCouplingState OF
+    
+    E_AxisCouplingState.UNSYNCED:
+        // --------------------------------------------------------------------------
+        // State: UNSYNCED (Axes Decoupled & Operating Independently)
+        // --------------------------------------------------------------------------
+        // Baseline operational state where both axes operate autonomously.
+        // Independent motion profiles (positioning, velocity, jogging, homing) 
+        // are fully permitted on both controllers.
+        //
+        // Invariants & Operational Mechanics:
+        // 1. Permissive Restoration: Explicitly re-asserts xSlaveAllowJog := TRUE. 
+        //    Because manual jogging on the slave is revoked while coupled, entering 
+        //    UNSYNCED restores independent manual jogging authority to the slave.
+        // 2. Function Block Slate Clearing: Continuously maintains Execute := FALSE 
+        //    on fbGearIn and fbGearOut, keeping their internal rising-edge detectors 
+        //    primed for subsequent operational triggers.
+        // 3. Diagnostic Memory Clearing: Resets udiCouplingErrorId to 0, confirming 
+        //    the coordinator is resting in healthy standby.
+        // 4. TwinCAT NC Online Tab Resynchronization Guard:
+        //    If a commissioning engineer manually couples the slave directly via the 
+        //    TwinCAT NC Axis Online tab or external ADS commands, stSlaveFeedback.xInGear 
+        //    becomes TRUE in cyclic NC process data. The coordinator immediately promotes 
+        //    to SYNCED to mirror NC physical reality, preventing state divergence.
+        // 5. Deliberate Gearing-In Gating:
+        //    Transitioning to GEARING_IN requires satisfying five strict preconditions:
+        //      a) Deliberate rising edge on fbPulsedCmdGearIn.Q.
+        //      b) Master controller resting in IDLE (_eMasterState = E_AxisState.IDLE).
+        //      c) Slave controller resting in IDLE (_eSlaveState = E_AxisState.IDLE).
+        //      d) Master confirmed at standstill (NOT stMasterFeedback.xMoving).
+        //      e) Slave confirmed at standstill (NOT stSlaveFeedback.xMoving).
+        //    In TwinCAT NC, MC_GearIn requires both axes to be stationary at standstill 
+        //    to establish electronic setpoint coupling without velocity jump discontinuities.
+        // --------------------------------------------------------------------------
+        xSlaveAllowJog     := TRUE;
+        fbGearIn.Execute   := FALSE;
+        fbGearOut.Execute  := FALSE;
+        udiCouplingErrorId := 0;
+		_xRegearRequired   := FALSE;
+        
+        // Priority 1: NC Online Tab / ADS Coupling Resynchronization Guard
+        IF stSlaveFeedback.xInGear THEN
+			lrActiveRatioNum    := lrResolvedRatioNum;
+            uiActiveRatioDenom  := uiResolvedRatioDenom;
+            _eAxisCouplingState := E_AxisCouplingState.SYNCED;
+            
+        // Priority 2: Gated Standstill Gearing Initiation
+        ELSIF fbPulsedCmdGearIn.Q 
+              AND (_eMasterState = E_AxisState.IDLE) 
+              AND (_eSlaveState = E_AxisState.IDLE) 
+              AND NOT stMasterFeedback.xMoving
+              AND NOT stSlaveFeedback.xMoving THEN
+              
+            _eAxisCouplingState := E_AxisCouplingState.GEARING_IN;
+        END_IF
+        
+    E_AxisCouplingState.GEARING_IN:
+        // --------------------------------------------------------------------------
+        // State: GEARING_IN (Electronic Setpoint Synchronization in Progress)
+        // --------------------------------------------------------------------------
+        // Commands the Slave axis setpoint generator to synchronize with the Master 
+        // trajectory using the encapsulated MC_GearIn function block.
+        //
+        // Motion Interlocking:
+        // While in this state, xMotionInterlock evaluates to TRUE downstream, 
+        // locking out independent positioning, velocity, homing, and jogging commands 
+        // in both child axis controllers (FB_AxisController).
+        //
+        // Exit & Abort Hierarchy (NC Kernel Physics & Teardown Guards):
+        // - Case 1 (Software Power Removal): If software enable is revoked on either 
+        //   drive mid-sync, coupling cannot complete normally. Dropping directly to 
+        //   ERROR could strand a half-formed NC coupling link. Therefore:
+        //     a) If NC coupling already took effect (stSlaveFeedback.xInGear = TRUE), 
+        //        the coordinator routes through GEARING_OUT to cleanly sever the NC link 
+        //        via MC_GearOut before resting in ERROR.
+        //     b) If not yet coupled, latches ERR_GEARIN_ABORTED and drops directly to ERROR.
+        // - Case 2 (Slave Stop/Halt Interruption): If an active stop or halt is commanded 
+        //   to the Slave, gearing aborts. In TwinCAT NC kernel physics, commanding a stop 
+        //   directly to a coupled slave automatically dissolves electronic gearing. 
+        //   The coordinator safely drops to UNSYNCED; the Master remains unaffected.
+        // - Case 3 (Master Stop/Halt Interruption): Stopping the Master does NOT dissolve 
+        //   slave gearing in the NC kernel. If stSlaveFeedback.xInGear is already TRUE, 
+        //   the coordinator routes to GEARING_OUT to decouple cleanly via MC_GearOut. 
+        //   If not yet coupled, drops directly to UNSYNCED.
+        // - Case 4 (NC Kernel Abort): If the NC kernel aborts the setpoint engagement, 
+        //   latches ERR_GEARIN_ABORTED and trips to ERROR.
+        // - Case 5 (Successful Synchronization): fbGearIn.InGear confirms the electronic 
+        //   gear is locked in the NC setpoint generator. Transitions cleanly to SYNCED.
+        // --------------------------------------------------------------------------
+        fbGearIn.Execute := TRUE;
+    
+        // Case 1: Software Power Removal Mid-Sync (Abnormal Abort -> Controlled Teardown)
+        IF NOT stSlaveEffectiveCmd.xPowerEnable OR NOT stMasterEffectiveCmd.xPowerEnable THEN
+            fbGearIn.Execute   := FALSE;
+            udiCouplingErrorId := TO_UDINT(E_AxisError.ERR_GEARIN_ABORTED);
+            
+            // Cleanly dissolve NC setpoint link via GEARING_OUT if kernel already locked
+            IF stSlaveFeedback.xInGear THEN
+                _eAxisCouplingState := E_AxisCouplingState.GEARING_OUT;
+            ELSE
+                _eAxisCouplingState := E_AxisCouplingState.ERROR;
+            END_IF
+
+        // Case 2: Deliberate Slave Interruption (Slave stops and kernel dissolves coupling)
+        ELSIF stSlaveEffectiveCmd.xHalt OR stSlaveEffectiveCmd.xStop THEN
+            fbGearIn.Execute    := FALSE;
+            _eAxisCouplingState := E_AxisCouplingState.UNSYNCED;
+        
+        // Case 3: Deliberate Master Interruption (Dissolve slave coupling if already linked)
+        ELSIF stMasterEffectiveCmd.xHalt OR stMasterEffectiveCmd.xStop THEN
+            fbGearIn.Execute := FALSE;
+        
+            IF stSlaveFeedback.xInGear THEN
+                _eAxisCouplingState := E_AxisCouplingState.GEARING_OUT;
+            ELSE
+                _eAxisCouplingState := E_AxisCouplingState.UNSYNCED;
+            END_IF
+            
+        // Case 4: Unexpected NC Kernel Profile Abort
+        ELSIF fbGearIn.CommandAborted THEN
+            fbGearIn.Execute    := FALSE;
+            udiCouplingErrorId  := TO_UDINT(E_AxisError.ERR_GEARIN_ABORTED);
+            _eAxisCouplingState := E_AxisCouplingState.ERROR;
+        
+        // Case 5: Normal Synchronization Handshake Confirmed
+        ELSIF fbGearIn.InGear THEN
+            fbGearIn.Execute    := FALSE;
+			lrActiveRatioNum    := lrResolvedRatioNum;
+            uiActiveRatioDenom  := uiResolvedRatioDenom;
+            _eAxisCouplingState := E_AxisCouplingState.SYNCED;
+        END_IF
+	
+	E_AxisCouplingState.GEARING_OUT:
+        // --------------------------------------------------------------------------
+        // State: GEARING_OUT (Electronic Decoupling in Progress)
+        // --------------------------------------------------------------------------
+        // Commands the Slave axis to dissolve its electronic setpoint coupling from 
+        // the Master using the encapsulated MC_GearOut function block.
+        //
+        // Physical NC Reality & Motion Interlocking:
+        // 1. In TwinCAT NC, MC_GearOut dissolves the setpoint table link. If uncoupled 
+        //    while moving, the Slave does not stop automatically; it continues moving 
+        //    as an autonomous axis at its last commanded setpoint velocity until actively 
+        //    halted or stopped.
+        // 2. While in this state, xMotionInterlock evaluates to TRUE downstream, 
+        //    suppressing new independent motion commands across both child controllers.
+        // 3. Administrative Setpoint Dissolution: MC_GearOut operates on setpoint tables 
+        //    and succeeds in the NC kernel even if drive power stages are disabled.
+        //
+        // Transition & Exit Hierarchy:
+        // - Priority 1 (Completion Handshake - fbGearOut.Done):
+        //     Branch A: If udiCouplingErrorId <> 0, decoupling was part of a teardown 
+        //               following a power cut or abort; routes strictly to ERROR.
+        //     Branch B: If xRegearPending is TRUE, this was a standstill ratio update; 
+        //               chains immediately into GEARING_IN to lock the new ratio.
+        //     Branch C: Standard decoupling; if the Slave was moving, commands an active 
+        //               stop (stSlaveEffectiveCmd.xStop := TRUE). If the policy enforces 
+        //               tandem cross-stopping (xStopMasterOnDecouple) and the Master is 
+        //               moving, also stops the Master. Transitions to UNSYNCED.
+        // - Priority 2 (Slave Interruption): If a Halt or Stop is issued to the Slave 
+        //   during normal powered uncoupling, drops immediately to UNSYNCED.
+        // - Priority 3 (Master Interruption): If a Halt or Stop is issued to the Master:
+        //     a) If still coupled (stSlaveFeedback.xInGear = TRUE): Routes back to 
+        //        SYNCED so the Master's deceleration ramp safely pulls the Slave to rest.
+        //     b) If already decoupled: Commands an active stop on the Slave and drops 
+        //        to UNSYNCED.
+        // --------------------------------------------------------------------------
+        fbGearOut.Execute := TRUE;
+        
+        // Non-Exiting Supervisory Modifier: Software Power Removal During Standstill Re-Gearing
+        // If software power is dropped mid-decouple during an automated re-gearing sequence, 
+        // cancel the pending re-gear and latch ERR_GEAROUT_ABORTED. We maintain fbGearOut.Execute 
+        // because MC_GearOut successfully severs the NC link even with power de-energized.
+        IF (NOT stSlaveEffectiveCmd.xPowerEnable OR NOT stMasterEffectiveCmd.xPowerEnable) 
+           AND xRegearPending THEN
+            xRegearPending     := FALSE;
+            udiCouplingErrorId := TO_UDINT(E_AxisError.ERR_GEAROUT_ABORTED);
+        END_IF
+        
+        // Priority 1: Completion Handshake (NC Setpoint Link Dissolved)
+        IF fbGearOut.Done THEN
+            fbGearOut.Execute := FALSE;
+            
+            // Branch A: Teardown followed an abort or power cut -> Terminate in ERROR
+            IF udiCouplingErrorId <> 0 THEN
+                _eAxisCouplingState := E_AxisCouplingState.ERROR;
+                
+            // Branch B: Automated Standstill Re-Gearing -> Chain directly to GEARING_IN
+            ELSIF xRegearPending THEN
+                xRegearPending      := FALSE;
+                _eAxisCouplingState := E_AxisCouplingState.GEARING_IN;
+                
+            // Branch C: Standard Operator Decouple -> Arbitrate stopping and drop to UNSYNCED
+            ELSE
+                // Bring Slave to a controlled standstill if it was uncoupled while in motion
+                IF stSlaveFeedback.xMoving THEN
+                    stSlaveEffectiveCmd.xStop := TRUE;
+                END_IF
+                
+                // Enforce tandem cross-stop on Master if policy dictates and Master is moving
+                IF xStopMasterOnDecouple AND stMasterFeedback.xMoving THEN
+                    stMasterEffectiveCmd.xStop := TRUE;
+                END_IF
+                
+                _eAxisCouplingState := E_AxisCouplingState.UNSYNCED;
+            END_IF
+
+        // Priority 2: Controlled Slave Interruption (Active only during healthy, powered uncoupling)
+        ELSIF (udiCouplingErrorId = 0) AND (stSlaveEffectiveCmd.xHalt OR stSlaveEffectiveCmd.xStop) THEN
+            fbGearOut.Execute   := FALSE;
+            xRegearPending      := FALSE;
+            _eAxisCouplingState := E_AxisCouplingState.UNSYNCED;
+        
+        // Priority 3: Controlled Master Interruption (Active only during healthy, powered uncoupling)
+        ELSIF (udiCouplingErrorId = 0) AND (stMasterEffectiveCmd.xHalt OR stMasterEffectiveCmd.xStop) THEN
+            fbGearOut.Execute := FALSE;
+            xRegearPending    := FALSE;
+            
+            // If NC setpoint link is still active, return to SYNCED to let Master ramp stop both axes
+            IF stSlaveFeedback.xInGear THEN
+                _eAxisCouplingState := E_AxisCouplingState.SYNCED;
+            ELSE
+                stSlaveEffectiveCmd.xStop := TRUE;
+                _eAxisCouplingState       := E_AxisCouplingState.UNSYNCED;
+            END_IF
+            
+        END_IF
+        
+    E_AxisCouplingState.SYNCED:
+        // --------------------------------------------------------------------------
+        // State: SYNCED (Active Master-Slave Electronic Gearing)
+        // --------------------------------------------------------------------------
+        // Operational state where the Slave axis is electronically geared to the 
+        // Master axis setpoint trajectory at the configured gear ratio.
+        // Driving the Master moves both axes in synchronized tandem.
+        //
+        // Invariants & Gating Rules:
+        // 1. Slave Jog Prohibition: Explicitly sets xSlaveAllowJog := FALSE. 
+        //    Independent manual jogging of the slave is strictly forbidden to prevent 
+        //    operator commands from fighting the electronic gear.
+        // 2. TwinCAT NC Kernel Decoupling Guard: Live cyclic process data 
+        //    (stSlaveFeedback.xInGear) is supervised continuously. If the NC kernel 
+        //    drops coupling (e.g., commissioning engineer uncouples via NC Axis Online 
+        //    tab, or external NC-level stop), the coordinator detects this immediately, 
+        //    enforces cross-stopping on the Master if configured by policy, and drops 
+        //    to UNSYNCED.
+        // 3. Power-Down Decoupling (Policy Governed): If software enable is revoked 
+        //    and xDecoupleOnDisable is configured TRUE (MODULAR policies), routes to 
+        //    GEARING_OUT to cleanly dissolve the NC link before resting in standby. 
+        //    If FALSE (PERSISTENT_TANDEM), axes power down geared and maintain sync.
+        // 4. Standstill Re-Gearing (Ratio Update): Standard MC_GearIn accepts a fixed 
+        //    ratio at standstill. To update ratio parameters without full cell reset:
+        //    Pulsing xCmdGearIn while resting at standstill (Master in IDLE, Slave in 
+        //    GEARED, both NOT moving) asserts xRegearPending := TRUE and routes to 
+        //    GEARING_OUT to dissolve the old ratio before chaining back to GEARING_IN.
+        // --------------------------------------------------------------------------
+        xSlaveAllowJog := FALSE;
+		
+		// Evaluate whether caller inputs differ from the active NC setpoint ratio
+        _xRegearRequired := (lrResolvedRatioNum <> lrActiveRatioNum) OR (uiResolvedRatioDenom <> uiActiveRatioDenom);
+        
+        // Priority 1: Physical NC Coupling Loss Guard (NC Tab decouple or kernel-level stop)
+        IF NOT stSlaveFeedback.xInGear THEN
+            // If policy dictates collective safety, halt master trajectory immediately
+            IF xStopMasterOnDecouple AND stMasterFeedback.xMoving THEN
+                stMasterEffectiveCmd.xStop := TRUE;
+            END_IF
+            
+            _eAxisCouplingState := E_AxisCouplingState.UNSYNCED;
+        
+        // Priority 2: Standstill Decouple on Software Power Removal (Policy Governed)
+        ELSIF (NOT stMasterEffectiveCmd.xPowerEnable OR NOT stSlaveEffectiveCmd.xPowerEnable)
+              AND xDecoupleOnDisable THEN
+            _eAxisCouplingState := E_AxisCouplingState.GEARING_OUT;
+
+        // Priority 3: Deliberate Operator Decoupling Request (Pulsed Edge)
+        ELSIF fbPulsedCmdGearOut.Q THEN
+            _eAxisCouplingState := E_AxisCouplingState.GEARING_OUT;
+        
+        // Priority 4: Standstill Re-Gearing / Ratio Update Request (Gated Standstill Sequence)
+        ELSIF fbPulsedCmdGearIn.Q 
+              AND (_eMasterState = E_AxisState.IDLE) 
+              AND (_eSlaveState = E_AxisState.GEARED) 
+              AND NOT stMasterFeedback.xMoving 
+              AND NOT stSlaveFeedback.xMoving THEN
+              
+            xRegearPending      := TRUE;
+            _eAxisCouplingState := E_AxisCouplingState.GEARING_OUT;
+        END_IF
+	
+	E_AxisCouplingState.ERROR:
+        // --------------------------------------------------------------------------
+        // State: ERROR (Coupling Fault Sweeper & Synchronized Recovery)
+        // --------------------------------------------------------------------------
+        // Universal fault and fail-safe coordination state. Triggered by:
+        // 1. PLCopen gearing block errors (fbGearIn.Error, fbGearOut.Error).
+        // 2. Kinematic configuration faults (ERR_RATIO_DIV_ZERO, ERR_RATIO_DENOM_NEGATIVE).
+        // 3. Trajectory aborts mid-coupling or mid-decoupling.
+        // 4. Either child axis controller tripping into ERROR or NC kernel faults.
+        //
+        // OPERATIONAL MECHANICS & SAFETY INVARIANTS:
+        // 1. Function Block Execution Sweeping:
+        //    Immediately drops Execute := FALSE across fbGearIn and fbGearOut, and clears 
+        //    xRegearPending := FALSE. In TwinCAT PLCopen, de-asserting Execute acknowledges 
+        //    and clears FB-level error registers once the underlying condition clears.
+        //
+        // 2. Controlled Cross-Axis Stopping (The Inversion Filter):
+        //    If a fault trips on one axis while the other is healthy and moving (e.g., 
+        //    Master executing MOVEABS while Slave hits a physical limit switch), the healthy 
+        //    axis must be brought to an immediate controlled stop at 0.0 mm/s.
+        //    - Deadlock Prevention Guard: The filter explicitly EXCLUDES axes resting in 
+        //      ERROR, RESET, OFF, IDLE, POWERING, or STOPPING.
+        //    - Stopping Handshake Integrity: In FB_AxisController, MC_Stop is level-triggered. 
+        //      If the coordinator held xStop := TRUE continuously after the axis reached 
+        //      standstill, fbStop.Done could never transition the child controller into IDLE! 
+        //      By dropping xStop := FALSE once the axis enters STOPPING, the child controller 
+        //      is permitted to complete its deceleration ramp and rest cleanly in IDLE.
+        //
+        // 3. Single-Click Supervisory Reset Dispatcher:
+        //    When an operator reset pulse is detected (fbPulsedCmdReset.Q):
+        //    - Ratio Parameter Guard: udiCouplingErrorId is cleared ONLY if kinematic 
+        //      parameters are mathematically valid (xRatioConfigValid = TRUE). If the 
+        //      denominator remains <= 0, clearing is rejected.
+        //    - Selective Reset Forwarding (ADS 0x707 Defense): In TwinCAT NC, commanding 
+        //      MC_Reset to a healthy NC axis causes the kernel to reject the call with 
+        //      ADS Error 0x707 (Device Not Ready). The coordinator inspects child states 
+        //      and forwards xReset := TRUE STRICTLY to whichever child axis is in ERROR.
+        //
+        // 4. Autonomous Three-Domain Recovery Handshake (IEC 60204-1):
+        //    Auto-clearing of faults is strictly prohibited. Transitioning out of ERROR 
+        //    requires all three distinct fault domains to confirm healthy recovery:
+        //      - Domain 1 (Coordinator): udiCouplingErrorId = 0 (proves FB errors cleared 
+        //        and ratio configuration is valid).
+        //      - Domain 2 (NC Hardware): NOT stMasterFeedback.xError AND NOT stSlaveFeedback.xError 
+        //        (confirms NC-SAF task has cleared fault registers in the cyclic image).
+        //      - Domain 3 (Child Controllers): Both child controllers have completed MC_Reset 
+        //        and reached safe resting states:
+        //        * Master resting in IDLE or OFF.
+        //        * Slave resting in IDLE, OFF, or GEARED (if coupling survived the reset).
+        //        NOTE: Including GEARED for the slave is critical to prevent a permanent 
+        //        recovery deadlock when an electronically coupled slave recovers while locked!
+        //
+        // 5. NC Physical Coupling Resynchronization:
+        //    Once all three domains are healthy, the coordinator evaluates live feedback:
+        //      - If stSlaveFeedback.xInGear = TRUE: The NC kernel retained coupling across 
+        //        the reset; the coordinator safely promotes to SYNCED.
+        //      - If stSlaveFeedback.xInGear = FALSE: Axes are physically independent; 
+        //        the coordinator safely promotes to UNSYNCED.
+        // --------------------------------------------------------------------------
+        fbGearIn.Execute  := FALSE;
+        fbGearOut.Execute := FALSE;
+        xRegearPending    := FALSE;
+		_xRegearRequired  := FALSE;
+
+        // 1. Controlled Cross-Axis Stopping of Healthy Moving Axes (Inversion Filter)
+        // Commands active stop to moving axes; excludes non-moving and recovery states to prevent deadlocks
+        IF (_eSlaveState = E_AxisState.ERROR)
+           OR (_eSlaveState = E_AxisState.RESET)
+           OR (_eSlaveState = E_AxisState.OFF)
+           OR (_eSlaveState = E_AxisState.IDLE)
+           OR (_eSlaveState = E_AxisState.STOPPING)
+           OR (_eSlaveState = E_AxisState.POWERING) THEN
+            stSlaveEffectiveCmd.xStop := FALSE;
+        ELSE
+            stSlaveEffectiveCmd.xStop := TRUE; // Active motion profile detected on Slave -> Controlled stop
+        END_IF
+
+        IF (_eMasterState = E_AxisState.ERROR)
+           OR (_eMasterState = E_AxisState.RESET)
+           OR (_eMasterState = E_AxisState.OFF)
+           OR (_eMasterState = E_AxisState.IDLE)
+           OR (_eMasterState = E_AxisState.STOPPING)
+           OR (_eMasterState = E_AxisState.POWERING) THEN
+            stMasterEffectiveCmd.xStop := FALSE;
+        ELSE
+            stMasterEffectiveCmd.xStop := TRUE; // Active motion profile detected on Master -> Controlled stop
+        END_IF
+
+        // 2. Supervisory Reset Dispatcher (Single-Click HMI Coordination)
+        // Acknowledges coordinator faults and selectively routes reset pulses to faulted child controllers
+        IF fbPulsedCmdReset.Q THEN
+            // Only clear coordinator error ID if configuration parameters are mathematically valid
+            IF xRatioConfigValid THEN
+                udiCouplingErrorId := 0;
+            END_IF
+            
+            // Forward reset pulse strictly to axes actively in ERROR (Prevents NC ADS Error 0x707)
+            IF _eMasterState = E_AxisState.ERROR THEN
+                stMasterEffectiveCmd.xReset := TRUE;
+            END_IF
+            
+            IF _eSlaveState = E_AxisState.ERROR THEN
+                stSlaveEffectiveCmd.xReset := TRUE;
+            END_IF
+        END_IF
+
+        // 3. Autonomous Three-Domain Recovery Handshake
+        // Confirms coordinator memory, NC cyclic images, and child controllers are clean before exit.
+        // Critical: Includes GEARED for the slave to prevent recovery deadlock when coupled.
+        IF (udiCouplingErrorId = 0)
+           AND NOT stMasterFeedback.xError 
+           AND NOT stSlaveFeedback.xError
+           AND ((_eMasterState = E_AxisState.IDLE) OR (_eMasterState = E_AxisState.OFF))
+           AND ((_eSlaveState = E_AxisState.IDLE) OR (_eSlaveState = E_AxisState.OFF) OR (_eSlaveState = E_AxisState.GEARED)) THEN
+            
+            // Resynchronize coordinator state with physical NC coupling status
+            IF stSlaveFeedback.xInGear THEN
+                _eAxisCouplingState := E_AxisCouplingState.SYNCED;   // NC retained coupling across recovery
+            ELSE
+                _eAxisCouplingState := E_AxisCouplingState.UNSYNCED; // NC is independent
+            END_IF
+            
+        END_IF
+        
+END_CASE
+
+// ==============================================================================
+// 6. INTERNAL MOTION INTERLOCK RESOLUTION
+// ==============================================================================
+// Broadcasts an interlock signal to both encapsulated axis controllers (fbMaster 
+// and fbSlave) to suppress new independent positioning, velocity, jogging, and homing 
+// requests during gearing transitions or while the system is faulted.
+// 
+// Architectural Invariants:
+// 1. Gearing Engagement / Disengagement (GEARING_IN, GEARING_OUT):
+//    Prevents child controllers from accepting fresh motion profiles or on-the-fly 
+//    target retargeting while electronic setpoint links are morphing in the NC kernel.
+// 2. Universal Fault (ERROR):
+//    Suppresses all motion initiation while unacknowledged faults are present.
+xMotionInterlock := (_eAxisCouplingState = E_AxisCouplingState.GEARING_IN) 
+                 OR (_eAxisCouplingState = E_AxisCouplingState.GEARING_OUT)
+                 OR (_eAxisCouplingState = E_AxisCouplingState.ERROR);
+
+// ==============================================================================
+// 7. UNCONDITIONAL FB EXECUTION (Axis Controllers & Gearing)
+// ==============================================================================
+// Architectural Invariant (Decoupled Execution Pattern):
+// In professional IEC 61131-3 motion control, PLCopen function blocks and child 
+// axis controllers must execute unconditionally every single PLC scan cycle at the 
+// bottom of the routine, completely outside the state machine CASE structure.
+//
+// 1. Continuous NC Cyclic Communication:
+//    Calling blocks conditionally inside CASE branches freezes their internal state 
+//    processing when that state is inactive. Unconditional execution ensures that 
+//    ADS message queues, setpoint generators, feedback parsers, and edge detectors 
+//    process every cycle.
+// 2. Clear Separation of Concerns:
+//    The state machine above strictly arbitrates operational intent (commands, 
+//    interlocks, and dynamics). The decoupled block calls below process the NC 
+//    communication and child state machine executions every scan.
+// ==============================================================================
+
+// --- Master Axis Controller Execution ---
+fbMaster(
+    Axis             := Axis_Master,
+    AxisCmd          := stMasterEffectiveCmd,
+    AxisFeedback     := stMasterFeedback,
+    stConfig         := Axis_M_Config,
+    xAllowJog        := TRUE,              // Master jog is always permitted (subject to xMotionInterlock)
+    xMotionInterlock := xMotionInterlock,
+	xCalibrationCam  := xMasterCalibrationCam,
+    
+    eCurrentState    => _eMasterState,
+    udiErrorId       => _udiMasterErrorId
+);
+
+// --- Slave Axis Controller Execution ---
+fbSlave(
+    Axis             := Axis_Slave,
+    AxisCmd          := stSlaveEffectiveCmd,
+    AxisFeedback     := stSlaveFeedback,
+    stConfig         := Axis_S_Config,
+    xAllowJog        := xSlaveAllowJog,     // Revoked dynamically in SYNCED to prevent fighting electronic gear
+    xMotionInterlock := xMotionInterlock,
+	xCalibrationCam  := xSlaveCalibrationCam,
+    
+    eCurrentState    => _eSlaveState,
+    udiErrorId       => _udiSlaveErrorId    
+);
+
+// --- Electronic Gearing Engagement Block ---
+fbGearIn(
+    Master           := Axis_Master,
+    Slave            := Axis_Slave,
+    RatioNumerator   := lrResolvedRatioNum,
+    RatioDenominator := uiResolvedRatioDenom,
+    Acceleration     := Axis_S_Config.lrMaxAcceleration,
+    Deceleration     := Axis_S_Config.lrMaxDeceleration,
+    Jerk             := Axis_S_Config.lrMaxJerk
+);
+
+// --- Electronic Decoupling Block ---
+fbGearOut(
+    Slave            := Axis_Slave
+);
+
+// ==============================================================================
+// 8. DIAGNOSTIC & TELEMETRY EGRESS (CYCLE-BOUNDARY MAPPING)
+// ==============================================================================
+// Gathers internal state machine registers and writes them atomically to public 
+// VAR_OUTPUT pins at the cycle boundary.
+//
+// Master Module Fault Evaluation:
+// - Evaluates _xError strictly based on the coordinator state (_eAxisCouplingState = ERROR).
+// - Section 3 guarantees that if either child controller or NC axis trips into ERROR, 
+//   the coordinator is immediately forced into ERROR, ensuring xError reflects the whole system.
+//
+// Prioritized Diagnostic Error Cascade:
+// Eliminates ambiguous fault reporting by arbitrating diagnostic error IDs in strict hierarchy:
+// - Priority 1: Coupling, ratio, or gearing function block faults (udiCouplingErrorId).
+// - Priority 2: Master axis controller or NC kernel faults (_udiMasterErrorId).
+// - Priority 3: Slave axis controller or NC kernel faults (_udiSlaveErrorId).
+// - Priority 4: All subsystems healthy -> 0.
+// ==============================================================================
+_xError := (_eAxisCouplingState = E_AxisCouplingState.ERROR);
+
+// Diagnostic Priority Cascade
+IF udiCouplingErrorId <> 0 THEN
+    _udiErrorId := udiCouplingErrorId;     
+ELSIF _udiMasterErrorId <> 0 THEN
+    _udiErrorId := _udiMasterErrorId;       
+ELSIF _udiSlaveErrorId <> 0 THEN
+    _udiErrorId := _udiSlaveErrorId;       
+ELSE
+    _udiErrorId := 0;                    
+END_IF
+
+// Atomic 1-to-1 write to public VAR_OUTPUT pins at cycle boundary
+eAxisCouplingState := _eAxisCouplingState;
+xRegearRequired    := _xRegearRequired;
+xError             := _xError;
+udiErrorId         := _udiErrorId;
+
+eMasterState       := _eMasterState;
+udiMasterErrorId   := _udiMasterErrorId;
+
+eSlaveState        := _eSlaveState;
+udiSlaveErrorId    := _udiSlaveErrorId;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

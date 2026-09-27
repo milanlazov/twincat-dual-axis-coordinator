@@ -1,0 +1,52 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisSystemCmd" Id="{a4ae0348-e71c-4e35-8d8d-217f59dae9b2}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            ST_AxisSystemCmd
+//  Version:        1.0.0.0
+// ==============================================================================
+/// Internal interlocked command pipeline consumed by single-axis controllers and coordinators.
+TYPE ST_AxisSystemCmd :
+STRUCT
+    // --- Drive Power Stage --- 
+    /// Drive power enable request; edge-filtered internally for anti-restart
+    xPowerEnable : BOOL;
+
+    // --- Autonomous Motion Initiation (Edge-Triggered) --- 
+    /// Absolute positioning move request (edge-triggered, supports retargeting)
+    xMoveAbs     : BOOL;
+
+    /// Continuous velocity move request (edge-triggered)
+    xMoveVelo    : BOOL;
+
+    // --- Manual Continuous Jogging (Level-Maintained) --- 
+    /// Manual fast reverse jog request (level-maintained)
+    xJogBkwFast  : BOOL;
+
+    /// Manual slow reverse jog request (level-maintained)
+    xJogBkwSlow  : BOOL;
+
+    /// Manual slow forward jog request (level-maintained)
+    xJogFwdSlow  : BOOL;
+
+    /// Manual fast forward jog request (level-maintained)
+    xJogFwdFast  : BOOL;
+
+    // --- Deceleration, Calibration & Recovery --- 
+    /// Controlled deceleration halt request (edge-triggered, abortable)
+    xHalt        : BOOL;
+
+    /// Active stop and axis setpoint lock request (level-maintained)
+    xStop        : BOOL;
+
+    /// Coordinate reference homing request (edge-triggered)
+    xHome        : BOOL;
+
+    /// Fault reset and alarm clearance request (edge-triggered)
+    xReset       : BOOL;
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

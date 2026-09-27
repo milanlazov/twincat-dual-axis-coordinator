@@ -1,0 +1,49 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="ST_AxisFeedback" Id="{c28a065f-3372-439b-91d5-aa3dec0e1d94}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            ST_AxisFeedback
+// Version:        1.0.0.0
+// ==============================================================================
+//
+/// Cyclic NC status, diagnostic flags, and live kinematic feedback for an individual axis.
+TYPE ST_AxisFeedback :
+STRUCT
+    // --- Operational Status Flags --- 
+    /// Drive inverter bridge energized and closed-loop holding torque active
+    xPowerActive : BOOL;
+
+    /// Axis is operational and ready to accept motion commands
+    xReady       : BOOL;
+
+    /// Axis is physically in motion
+    xMoving      : BOOL;
+
+    /// Axis coordinate system is calibrated and homed
+    xHomed       : BOOL;
+
+    /// Target coordinate reached within configured position window
+    xInPosition  : BOOL;
+
+    /// Slave axis is electronically geared to master setpoint trajectory
+    xInGear      : BOOL;
+
+    /// Axis hardware, drive amplifier, or NC kernel fault active
+    xError       : BOOL;
+
+    // --- Fault Diagnostics --- 
+    /// Active NC kernel or drive error code (0 if healthy)
+    udiErrorId   : UDINT;
+
+    // --- Live Kinematic Feedback --- 
+    /// Actual position feedback from encoder
+    lrActPos     : LREAL;
+
+    /// Actual velocity feedback from NC setpoint/encoder
+    lrActVel     : LREAL;
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

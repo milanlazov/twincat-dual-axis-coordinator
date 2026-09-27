@@ -1,0 +1,60 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <DUT Name="E_AxisState" Id="{24c27f40-ea22-4718-aeeb-b2f54137ccb4}">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           17.09.2026
+// DUT:            E_AxisState
+// Version:        1.0.0.0
+// ==============================================================================
+/// Operational control states for an individual single-axis controller.
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_AxisState :
+(
+    // --- Initialization & Standby --- 
+    /// Drive power disabled; inverter bridge de-energized
+    OFF := 0,  
+
+    /// Drive power-on sequence in progress
+    POWERING := 1,  
+
+    /// Axis powered, at standstill, and awaiting motion commands
+    IDLE := 2,  
+
+    /// Axis calibration and reference coordinate search active
+    HOMING := 3,  
+
+    // --- Active Motion Profiles --- 
+    /// Executing absolute positioning profile
+    MOVEABS := 4,  
+
+    /// Executing continuous velocity profile
+    MOVEVELO := 5,  
+
+    /// Manual continuous jogging active
+    JOGGING := 6,  
+
+    /// Motion detected outside PLC control (NC Online tab or ADS)
+    EXTERNAL_MOTION := 7,  
+
+    // --- Standstill & Coordinated Rest --- 
+    /// Controlled abortable deceleration stop active
+    HALTING := 8,  
+
+    /// Active stop command engaged; axis setpoint locked
+    STOPPING := 9,  
+
+    /// Coupled as a slave to an external master trajectory
+    GEARED := 10, 
+
+    // --- Recovery & Diagnostics --- 
+    /// Fault reset and alarm clearance sequence active
+    RESET := 11, 
+
+    /// Controller or NC kernel fault active
+    ERROR := 12
+);
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

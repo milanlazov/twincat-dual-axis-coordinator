@@ -1,0 +1,76 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.18">
+  <POU Name="FB_AxisFeedbackMapping" Id="{6e143db5-9cb6-4cca-8f91-f01743ec033c}" SpecialFunc="None">
+    <Declaration><![CDATA[// ==============================================================================
+// Author:         Milan Lazov
+// Date:           16.09.2026
+// POU:            FB_AxisFeedbackMapping
+// Version:        1.0.0.0
+// ==============================================================================
+/// Ingress cyclic feedback parser extracting process data from TwinCAT NC registers into standardized feedback telemetry.
+// Operational Architecture & Features:
+// - Live Cyclic Process Image Extraction: Directly samples Axis.Status and Axis.NcToPlc 
+//   without initiating NC commands or altering drive state.
+// - Decoupled Supervisory Abstraction: Decouples physical drive and fieldbus layouts 
+//   from motion controllers and supervisory equipment modules.
+// - Stale Error Code Suppression: Validates Axis.Status.Error before reporting 
+//   NcToPlc.ErrorCode to guarantee zero false error IDs during healthy operation.
+FUNCTION_BLOCK FB_AxisFeedbackMapping
+VAR_IN_OUT
+    // --- Hardware NC Axis Interface ---
+
+    /// Bidirectional hardware interface linking the PLC to the TwinCAT NC axis.
+    /// Must be bound to an AXIS_REF instance linked to an NC axis in the TwinCAT motion task.
+    /// Evaluated cyclically via Axis.ReadStatus() to refresh internal status flags.
+    Axis       : AXIS_REF;
+END_VAR
+
+VAR_OUTPUT
+    // --- Operational Telemetry & Process Image ---
+
+    /// Standardized cyclic feedback process image reflecting actual NC axis status and kinematics.
+    /// Outputs ST_AxisFeedback containing live motion telemetry: actual position, actual velocity, 
+    /// power status, operational ready flag, standstill/moving status, homing calibration status, 
+    /// in-position flag, NC coupling flag (xInGear), error status, and active NC error ID.
+    stFeedback : ST_AxisFeedback;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ==============================================================================
+// 1. CYCLIC NC STATUS REFRESH
+// ==============================================================================
+// In TwinCAT NC, internal status flags (Moving, Homed, Coupled, Disabled, Error) 
+// are not decoded automatically by the NC-SAF cyclic memory transfer. 
+// Axis.ReadStatus() must be called explicitly within the PLC task context to 
+// evaluate Axis.NcToPlc.StateDWord and refresh the Axis.Status structure.
+Axis.ReadStatus();
+
+// ==============================================================================
+// 2. DISCRETE STATUS FLAGS & KINEMATIC TELEMETRY MAPPING
+// ==============================================================================
+// Translates decoded NC status bits and dynamic trajectory feedback into the 
+// standardized ST_AxisFeedback process image for downstream controllers.
+stFeedback.xPowerActive := NOT Axis.Status.Disabled; 
+stFeedback.xReady       := Axis.Status.Operational;
+stFeedback.xMoving      := Axis.Status.Moving;
+stFeedback.xHomed       := Axis.Status.Homed;
+stFeedback.xInPosition  := Axis.Status.InPositionArea;
+stFeedback.xInGear      := Axis.Status.Coupled; 
+stFeedback.xError       := Axis.Status.Error;
+
+// --- Stale NC Error Register Defense ---
+// In TwinCAT NC kernel behavior, Axis.NcToPlc.ErrorCode may retain the previous 
+// fault ID in memory even after a successful fault reset until overwritten by a 
+// new event. Error code reporting is gated strictly behind Axis.Status.Error to 
+// guarantee that healthy axes always publish udiErrorId = 0 to supervisory logic.
+IF Axis.Status.Error THEN
+    stFeedback.udiErrorId := Axis.NcToPlc.ErrorCode;
+ELSE
+    stFeedback.udiErrorId := 0;
+END_IF
+
+// Dynamic Kinematic Feedback
+stFeedback.lrActPos     := Axis.NcToPlc.ActPos;
+stFeedback.lrActVel     := Axis.NcToPlc.ActVelo;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

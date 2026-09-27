@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<TcSmProject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.beckhoff.com/schemas/2012/07/TcSmProject" TcSmVersion="1.0" TcVersion="3.1.4026.24">
+	<Project ProjectGUID="{2CFB558C-5A22-43F2-B009-9DE935384A99}" Target64Bit="true" ShowHideConfigurations="#x6">
+		<Plc>
+			<Project GUID="{95774306-E2BB-498D-A190-8D535EF55556}" Name="Tc3_LmDualAxisCoordinator" PrjFilePath="Tc3_LmDualAxisCoordinator\Tc3_LmDualAxisCoordinator.plcproj" TmcFilePath="Tc3_LmDualAxisCoordinator\Tc3_LmDualAxisCoordinator.tmc" ReloadTmc="true" AmsPort="851" FileArchiveSettings="#x000e"/>
+		</Plc>
+	</Project>
+</TcSmProject>
