@@ -12,7 +12,7 @@ This repository provides the core `.compiled-library` (featuring `FB_AxisControl
 
 The following sequence demonstrates the library's physical invariant guarding, anti-restart protection, and dynamic motion coordination:
 
-> **[ Placeholder: Insert your 1-minute Hero GIF/Video here ]**
+https://github.com/user-attachments/assets/1aa43de6-1781-490f-b971-03235392b34f
 
 **What you are seeing in this sequence:**
 1. **Invariant Guarding:** The system boots with unconfigured kinematic limits (`0.00`). When power is requested, the controller's validation block (`fValidateAxisConfig`) intercepts the invalid parameters and blocks the transition, preventing inevitable NC trajectory faults.

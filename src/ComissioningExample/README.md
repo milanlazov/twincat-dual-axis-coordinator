@@ -504,7 +504,7 @@ This section provides operational walkthroughs of the motion control library and
 
 ### 1. Axis Configuration & Tuning Drawer
 
-![Axis Configuration Window](../../docs/images/09_hmi_axis_config.png)
+https://github.com/user-attachments/assets/c0b47eb0-26cb-4506-853e-e0741a462834
 
 * **What It Shows:** Accessing the slide-out tuning drawer from the axis faceplate to inspect and configure kinematic dynamics: operational velocities, acceleration/deceleration ramps, S-curve jerk smoothing, manual jog limits, and supervisory timeouts.
 * **Why It Matters:** Allows commissioning engineers to tune axis dynamics live during machine setup without recompiling or downloading PLC code.
@@ -513,7 +513,7 @@ This section provides operational walkthroughs of the motion control library and
 
 ### 2. Controlled Deceleration Stop on Software Disable
 
-https://github.com/user-attachments/assets/video02_controlled_stop_on_disable.mp4
+https://github.com/user-attachments/assets/da4c922e-e245-4954-876a-53b202a747ea
 
 * **What It Shows:** An axis is traveling at full operational velocity. Dropping the software enable signal (`xPowerEnable := FALSE`) does not immediately drop the drive power stage; instead, the controller automatically commands a controlled deceleration stop to 0.0 mm/s before de-energizing the drive.
 * **Why It Matters:** Cutting drive bridge power while an axis is moving drops holding torque instantaneously, causing mechanical shock, uncontrolled freewheeling, and NC following error faults. Decelerating to standstill first protects the drivetrain and leadscrews.
@@ -522,7 +522,7 @@ https://github.com/user-attachments/assets/video02_controlled_stop_on_disable.mp
 
 ### 3. On-The-Fly Trajectory Retargeting (MoveAbs & MoveVelo Ping-Pong)
 
-https://github.com/user-attachments/assets/video03_onthefly_retargeting_abs_velo.mp4
+https://github.com/user-attachments/assets/4449e3c7-6c00-4f69-b5e2-4860840f82e5
 
 * **What It Shows:**  
   1. **MoveAbs Ping-Pong:** While executing an absolute move, pulsing a new target coordinate flips between alternating positioning instances (`fbMoveAbsolute1` / `fbMoveAbsolute2` with `BufferMode := MC_Aborting`), recalculating the trajectory mid-flight without stopping or velocity dips.  
@@ -533,7 +533,7 @@ https://github.com/user-attachments/assets/video03_onthefly_retargeting_abs_velo
 
 ### 4. Coupling Policy: PERSISTENT_TANDEM
 
-https://github.com/user-attachments/assets/video04_policy_persistent_tandem.mp4
+https://github.com/user-attachments/assets/7a94cf77-6abc-49e8-b9f6-180a2f73df53
 
 * **What It Shows:** Electronic gearing persists across software power cycles. If power is removed, axes power down geared and remain coupled in the NC kernel. Both stations must assert power enable before either drive is permitted to energize (dual-permissive power). Tripping or stopping either axis triggers an immediate cross-stop on the partner.
 * **Why It Matters:** Designed for rigid mechanical pairings (e.g., dual-driven gantries or mechanically linked leadscrews) where independent movement or unsynchronized power-up would cause physical binding or frame distortion.
@@ -542,7 +542,7 @@ https://github.com/user-attachments/assets/video04_policy_persistent_tandem.mp4
 
 ### 5. Coupling Policy: MODULAR_TANDEM_STOP
 
-https://github.com/user-attachments/assets/video05_policy_modular_tandem_stop.mp4
+https://github.com/user-attachments/assets/8b5d65cc-615e-4b9c-94af-90ea81d161ef
 
 * **What It Shows:** Axes power up independently. When software power is removed while coupled, the coordinator automatically executes `MC_GearOut` to dissolve electronic gearing before entering standby. While coupled, collective safety is enforced: stopping or faulting the slave axis initiates an immediate cross-axis stop on the master.
 * **Why It Matters:** Ideal for dynamic pick-and-place or multi-belt transfer systems that synchronize on demand during production but decouple during maintenance, while still requiring collective safety when coupled.
@@ -551,7 +551,7 @@ https://github.com/user-attachments/assets/video05_policy_modular_tandem_stop.mp
 
 ### 6. Coupling Policy: MODULAR_INDEPENDENT
 
-https://github.com/user-attachments/assets/video06_policy_modular_independent.mp4
+https://github.com/user-attachments/assets/43dd3a2f-9f25-40ac-9ed5-0659d21c4cea
 
 * **What It Shows:** Axes power up independently and automatically decouple on power-down via `MC_GearOut`. Unlike the tandem policies, the master axis maintains complete trajectory autonomy: if the slave axis is halted, stopped, or uncoupled, the master continues its motion profile uninterrupted.
 * **Why It Matters:** Designed for process flows where the master axis drives the main line (e.g., a continuous packaging conveyor) and auxiliary slave axes synchronize only for intermittent operations without being permitted to halt main line throughput.
@@ -560,7 +560,7 @@ https://github.com/user-attachments/assets/video06_policy_modular_independent.mp
 
 ### 7. Electronic Decoupling in Motion
 
-https://github.com/user-attachments/assets/video07_gearing_out_in_motion.mp4
+https://github.com/user-attachments/assets/adf48245-4c0c-4540-ac46-660c0d8715fe
 
 * **What It Shows:** Commanding `xCmdGearOut` while the axes are actively traveling coupled. The NC setpoint table link dissolves, the slave axis is brought to a controlled stop, and the master behavior responds according to the active coupling policy.
 * **Why It Matters:** Demonstrates clean NC setpoint dissolution on the fly without causing kinematic step jumps or NC synchronization alarms.
@@ -569,7 +569,7 @@ https://github.com/user-attachments/assets/video07_gearing_out_in_motion.mp4
 
 ### 8. Dynamic Pairing Topologies & Standstill Re-Gearing
 
-https://github.com/user-attachments/assets/video08_custom_topology_regearing.mp4
+https://github.com/user-attachments/assets/7e3173f2-8dd9-4360-a442-9725e0e36d35
 
 * **What It Shows:** The coordinator is electronically geared under the `CUSTOM` topology. Updating numerator or denominator inputs while coupled asserts `xRegearRequired`. Once the axes reach standstill, pulsing `xCmdGearIn` automatically executes a sequential uncouple-and-recouple sequence (`GEARING_OUT` $\to$ `GEARING_IN`) to lock the new gear ratio.
 * **Why It Matters:** Allows production lines to switch product recipes or gear ratios on the fly without rebooting TwinCAT or cycling machine power.
@@ -578,7 +578,7 @@ https://github.com/user-attachments/assets/video08_custom_topology_regearing.mp4
 
 ### 9. External NC Motion Tracking (EXTERNAL_MOTION)
 
-https://github.com/user-attachments/assets/video09_external_motion_online_tab.mp4
+https://github.com/user-attachments/assets/ca0a8b4c-85df-42b1-9c1d-34ea392c9abc
 
 * **What It Shows:** While the axis is resting in `IDLE`, an engineer manually jogs the axis directly using the TwinCAT NC Axis Online tab hotkeys (F1–F4). The controller detects unauthorized motion, transitions to `EXTERNAL_MOTION`, sweeps all internal PLC motion blocks to false, and automatically returns to `IDLE` once standstill is confirmed.
 * **Why It Matters:** Prevents PLC command collisions with commissioning engineers working in the NC Online tab and guarantees that supervisory coordinators always receive truthful telemetry of physical movement.
@@ -587,7 +587,7 @@ https://github.com/user-attachments/assets/video09_external_motion_online_tab.mp
 
 ### 10. Deceleration Dynamics: Halt vs. Stop
 
-https://github.com/user-attachments/assets/video10_halt_vs_stop_dynamics.mp4
+https://github.com/user-attachments/assets/5ae66df8-1fab-4818-b146-06ac3d9af17d
 
 * **What It Shows:**  
   1. **MC_Halt (Abortable):** A halt command begins decelerating the axis to rest, but issuing a new positioning command mid-ramp preempts the halt immediately, resuming travel without reaching standstill.  
@@ -598,7 +598,7 @@ https://github.com/user-attachments/assets/video10_halt_vs_stop_dynamics.mp4
 
 ### 11. Manual Continuous Jogging
 
-https://github.com/user-attachments/assets/video11_manual_jogging.mp4
+https://github.com/user-attachments/assets/dd72f1b1-430a-452e-b435-7f0fe2ced5d7
 
 * **What It Shows:** Manual continuous jogging in forward and reverse directions utilizing dynamic slow and fast velocity setpoints, executing smooth, controlled deceleration ramps to standstill upon releasing the command buttons.
 * **Why It Matters:** Essential for manual axis setup, fixture alignment, and teach-pendant operations without triggering autonomous positioning profiles.
@@ -607,7 +607,7 @@ https://github.com/user-attachments/assets/video11_manual_jogging.mp4
 
 ### 12. Simultaneous Dual-Axis Homing Calibration
 
-https://github.com/user-attachments/assets/video12_independent_dual_homing.mp4
+https://github.com/user-attachments/assets/c7631701-c7fd-492c-8752-e30b696cd5e0
 
 * **What It Shows:** Axes are uncoupled and calibrated simultaneously. Each axis executes its referencing sequence with independent homing modes and offset coordinates, establishing calibrated zero baselines concurrently.
 * **Why It Matters:** Drastically reduces machine startup and shift initialization time by referencing multiple axes concurrently rather than sequentially.
@@ -616,7 +616,7 @@ https://github.com/user-attachments/assets/video12_independent_dual_homing.mp4
 
 ### 13. NC Dynamic Limit Fault & Hardware Recovery Handshake
 
-https://github.com/user-attachments/assets/video13_nc_fault_recovery.mp4
+https://github.com/user-attachments/assets/4a2242a6-d72c-4dc0-a832-08a5d04c3155
 
 * **What It Shows:** Setting a kinematic profile parameter (e.g., `lrMaxVelocity`) in the tuning drawer higher than the maximum limit configured in the TwinCAT NC Axis parameters tab, then commanding motion. The TwinCAT NC kernel setpoint generator rejects the trajectory and trips an NC error (e.g., `16#4221` in the `16#4000`–`16#4FFF` pass-through range). The controller captures the NC error code, displays it on the HMI, and executing a reset triggers an NC hardware reset (`MC_Reset`), confirming that the NC fault is cleared before returning the axis to `IDLE`.
 * **Why It Matters:** Demonstrates fault recovery under a genuine NC kernel trip: executing `MC_Reset`, arbitrating task scan synchronization, and verifying that the NC error register is clear before re-arming the machine into standby.
