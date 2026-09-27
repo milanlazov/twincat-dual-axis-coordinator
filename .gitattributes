@@ -1,0 +1,11 @@
+# ==============================================================================
+# GitHub Linguist Overrides
+# Exclude TF2000 HMI web assets from repository language statistics
+# ==============================================================================
+*.css linguist-vendored
+*.js linguist-vendored
+*.html linguist-vendored
+*.json linguist-vendored
+
+# Exclude your exact HMI project folder
+**/HMI_DualDriveMotion/** linguist-vendored
