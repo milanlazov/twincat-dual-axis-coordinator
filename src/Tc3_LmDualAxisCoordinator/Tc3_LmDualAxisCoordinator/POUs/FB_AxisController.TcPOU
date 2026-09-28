@@ -891,43 +891,54 @@ CASE _eCurrentState OF
     
     E_AxisState.RESET:
         // --------------------------------------------------------------------------
-        // State: RESET (Error Acknowledgment & Dual-Domain Fault Recovery)
+        // State: RESET (Error Acknowledgment, Motion Handoff & Dual-Domain Recovery)
         // --------------------------------------------------------------------------
         // Clears axis faults by arbitrating between internal PLC software errors 
-        // and NC kernel / drive hardware trips.
+        // and NC kernel / drive hardware trips, delegating in-flight deceleration ramps 
+        // to the STOPPING state to guarantee zero-latency operator reset capture.
         //
-        // 1. Software-Only Fault Recovery (NC Kernel Healthy):
-        // If the error was generated purely in PLC software (e.g. ERR_POWER_TIMEOUT, 
-        // ERR_HALT_ABORTED), the NC kernel is healthy (AxisFeedback.xError = FALSE). 
-        // Calling MC_Reset against a healthy NC axis violates PLCopen specifications and 
-        // causes the NC kernel to reject the command with ADS Error 0x707 (Device Not Ready). 
-        // Branch 1 bypasses MC_Reset entirely, clears _udiErrorId, and transitions immediately 
-        // to IDLE (if energized) or OFF.
+        // Operational Mechanics & Safety Invariants:
+        // 1. Software-Only Fault Recovery (NC Kernel Healthy & Gate Interlock):
+        //    If the fault originated in PLC software (e.g. ERR_POWER_TIMEOUT, ERR_HALT_ABORTED), 
+        //    the NC kernel is healthy (AxisFeedback.xError = FALSE). Calling MC_Reset against 
+        //    a healthy NC axis violates PLCopen specifications and causes the NC kernel to 
+        //    reject the command with ADS Error 0x707 (Device Not Ready). 
+        //    Branch 1 is gated by NOT fbReset.Execute to ensure that active MC_Reset sequences 
+        //    are not prematurely hijacked when the NC error drops. It clears _udiErrorId 
+        //    in exactly one scan cycle once configuration invariants are confirmed.
         //
-        // 2. NC Hardware / Drive Fault Recovery (MC_Reset Execution):
-        // Active NC faults (AxisFeedback.xError = TRUE) execute the encapsulated MC_Reset block 
-        // to clear drive amplifier alarms and NC error registers.
+        // 2. NC Hardware / Drive Fault Recovery (Asynchronous Handshake & Deadlock Guard):
+        //    Active NC faults (AxisFeedback.xError = TRUE) execute the encapsulated MC_Reset 
+        //    block to clear drive amplifier alarms and NC error registers.
+        //    - Task Synchronization Handshake: Evaluates fbReset.Done and verifies whether the 
+        //      NC-SAF task has written its updated error-free process image to cyclic memory 
+        //      (NOT AxisFeedback.xError) before releasing the controller to IDLE or OFF.
+        //    - Persistent Fault Deadlock Guard: If MC_Reset reports Done but the underlying 
+        //      hardware fault persists (e.g. active STO or un-resettable drive trip), the 
+        //      controller drops fbReset.Execute, re-latches the active NC error ID, and returns 
+        //      to ERROR, preventing an unrecoverable freeze in the RESET state.
         //
-        // Task Synchronization Handshake:
-        // Exiting Branch 2 strictly requires both fbReset.Done AND NOT AxisFeedback.xError. 
-        // This ensures the NC-SAF task has written its updated error-free process image 
-        // to PLC cyclic memory before the controller resumes operational readiness, 
-        // eliminating false re-trips caused by cycle timing latency.
-        // fbReset.Execute is dropped to FALSE immediately upon Done or Error.
+        // 3. Dynamic Motion Delegation (The 1-Scan STOPPING Handoff):
+        //    Neither software stops nor hardware decelerations are executed inside RESET. 
+        //    If physical movement is detected (AxisFeedback.xMoving = TRUE) following either 
+        //    software clearing or MC_Reset completion, the controller hands off immediately 
+        //    in one cycle to STOPPING. This allows MC_Stop to supervise the remainder of the 
+        //    braking ramp at lrStopDeceleration, ensures truthful telemetry, and prevents 
+        //    accidental triggers of tonExternalMotion in IDLE.
         // --------------------------------------------------------------------------
         
         // Branch 1: PLC Software-Only Fault (NC Kernel is completely healthy)
-        IF NOT AxisFeedback.xError THEN
+        IF NOT AxisFeedback.xError AND NOT fbReset.Execute THEN
             fbReset.Execute := FALSE;
             
             // Refuse to clear if configuration invariants are still invalid
             IF udiConfigErrorId <> 0 THEN
                 _eCurrentState := E_AxisState.ERROR;
-				_udiErrorId    := udiConfigErrorId;
+                _udiErrorId    := udiConfigErrorId;
             ELSE
                 _udiErrorId := 0; // Cleared upon successful reset
                 
-                // If still decelerating from a software stop, finish ramp in STOPPING
+                // If still decelerating from an error stop, delegate remainder of ramp to STOPPING
                 IF AxisFeedback.xMoving THEN
                     _eCurrentState := E_AxisState.STOPPING;
                 ELSIF fbPower.Status THEN
@@ -937,27 +948,38 @@ CASE _eCurrentState OF
                 END_IF
             END_IF
 
-        // Branch 2: NC Kernel / Drive Hardware Fault
+        // Branch 2: NC Kernel / Drive Hardware Fault (MC_Reset Handshake)
         ELSE
             fbReset.Execute := TRUE;
             
-            // Handshake: MC_Reset reported Done AND cyclic image confirms fault cleared
-            IF fbReset.Done AND NOT AxisFeedback.xError THEN
+            // MC_Reset completed its execution cycle
+            IF fbReset.Done THEN
                 fbReset.Execute := FALSE;     
                 
-                IF fbPower.Status THEN
-                    _eCurrentState := E_AxisState.IDLE;
-                ELSE
-                    _eCurrentState := E_AxisState.OFF;
-                END_IF
+                // Fault successfully cleared in NC-SAF process image
+                IF NOT AxisFeedback.xError THEN
+                    _udiErrorId := 0; // Cleared only upon verified recovery
+                    
+                    // If motor is still coasting/braking to standstill, finish in STOPPING
+                    IF AxisFeedback.xMoving THEN
+                        _eCurrentState := E_AxisState.STOPPING;
+                    ELSIF fbPower.Status THEN
+                        _eCurrentState := E_AxisState.IDLE;
+                    ELSE
+                        _eCurrentState := E_AxisState.OFF;
+                    END_IF
                 
-                _udiErrorId     := 0; // Cleared only upon successful exit
+                // Reset reported Done, but physical drive fault persists (prevents freeze in RESET)
+                ELSE
+                    _udiErrorId    := AxisFeedback.udiErrorId;
+                    _eCurrentState := E_AxisState.ERROR;
+                END_IF
             
-            // Reset command rejected or faulted by NC kernel
+            // Reset command rejected or faulted by NC kernel (e.g. ADS timeout)
             ELSIF fbReset.Error THEN
                 fbReset.Execute := FALSE;
-                _udiErrorId    := fbReset.ErrorID; 
-                _eCurrentState := E_AxisState.ERROR;
+                _udiErrorId     := fbReset.ErrorID; 
+                _eCurrentState  := E_AxisState.ERROR;
             END_IF
         END_IF
     
